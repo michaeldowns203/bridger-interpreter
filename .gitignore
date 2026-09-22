@@ -1,1 +1,4 @@
 /target
+.mcp*
+.codex*
+.DS_Store

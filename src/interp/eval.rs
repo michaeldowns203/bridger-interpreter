@@ -27,26 +27,75 @@
 //! span the checker recorded it at (`Checker::record_conversion`), or a `?`
 //! quietly passes its payload through unconverted.
 
-use super::Interpreter;
+use super::{type_of, Interpreter, RuntimeError};
 use super::{Control, Env, Value};
-use crate::ast::Expr;
+use crate::ast::{BinOp, Expr, Lit, Span, Ty, UnOp};
+use crate::interp::value::List;
+use std::rc::Rc;
 
 impl Interpreter {
     /// Evaluate `e` in environment `env`.
     pub fn eval_expr(&mut self, e: &Expr, env: &Env) -> Result<Value, Control> {
-        // `env` goes unused until M2 (E-Var, E-Block). Delete this line once you
-        // read from `env`; it only keeps the unused-variable lint quiet for now.
-        let _ = env;
         match e {
             // ---- M1: expressions ----
-            Expr::Lit(..) => todo_m1!("E-Lit"),
-            Expr::Unary(..) => todo_m1!("E-Neg / E-Not (ref & deref join at M3)"),
-            Expr::Binary(..) => {
-                todo_m1!("E-Arith / E-Ord / E-Eq / E-And / E-Or / E-Concat / E-Cons")
+            Expr::Lit(lit, _) => match lit {
+                Lit::Int(lit) => Ok(Value::Int(*lit)),
+                Lit::Bool(lit) => Ok(Value::Bool(*lit)),
+                Lit::Str(lit) => Ok(Value::Str(Rc::from(lit.as_str()))),
+                Lit::Unit => Ok(Value::Unit),
+            },
+            Expr::Unary(un_op, expr, span) => match un_op {
+                UnOp::Neg => Ok(Value::Int(
+                    expect_int(self.eval_expr(expr, env)?, *span)?.wrapping_neg(),
+                )),
+                UnOp::Not => Ok(Value::Bool(!expect_bool(
+                    self.eval_expr(expr, env)?,
+                    *span,
+                )?)),
+                UnOp::Ref => todo_m3!("E-Ref"),
+                UnOp::Deref => todo_m3!("E-Deref"),
+            },
+            Expr::Binary(bin_op, expr1, expr2, span) => {
+                let left = self.eval_expr(expr1, env)?;
+                match bin_op {
+                    // Keep the right expression unevaluated until it is needed.
+                    BinOp::And => {
+                        let left = expect_bool(left, *span)?;
+                        Ok(Value::Bool(
+                            left && expect_bool(self.eval_expr(expr2, env)?, *span)?,
+                        ))
+                    }
+                    BinOp::Or => {
+                        let left = expect_bool(left, *span)?;
+                        Ok(Value::Bool(
+                            left || expect_bool(self.eval_expr(expr2, env)?, *span)?,
+                        ))
+                    }
+                    _ => {
+                        let right = self.eval_expr(expr2, env)?;
+                        eval_binary(*bin_op, left, right, *span)
+                    }
+                }
             }
-            Expr::Tuple(..) => todo_m1!("E-Tuple"),
-            Expr::List(..) => todo_m1!("E-List"),
-            Expr::Proj(..) => todo_m1!("E-Proj (tuple projection)"),
+            Expr::Tuple(elements, _) => {
+                Ok(Value::Tuple(Rc::from(self.eval_elements(elements, env)?)))
+            }
+            Expr::List(elements, _) => {
+                Ok(Value::List(List::from(self.eval_elements(elements, env)?)))
+            }
+            Expr::Proj(expr, index, span) => {
+                let value = self.eval_expr(expr, env)?;
+                let field = match &value {
+                    Value::Tuple(values) => values.get(*index as usize).cloned(),
+                    _ => None,
+                };
+                field.ok_or_else(|| {
+                    Control::Raise(RuntimeError::NoSuchField {
+                        field: index.to_string(),
+                        span: *span,
+                    })
+                })
+            }
 
             // ---- M2: binding ----
             Expr::Var(..) => todo_m2!("E-Var"),
@@ -77,5 +126,85 @@ impl Interpreter {
             Expr::Field(..) => todo_m8!("E-Field (struct field access)"),
             Expr::Method(..) => todo_m8!("E-Method (head-type dispatch)"),
         }
+    }
+
+    /// Evaluate collection elements left to right, preserving child errors.
+    fn eval_elements(&mut self, elements: &[Expr], env: &Env) -> Result<Vec<Value>, Control> {
+        let mut values = Vec::with_capacity(elements.len());
+        for element in elements {
+            values.push(self.eval_expr(element, env)?);
+        }
+        Ok(values)
+    }
+}
+
+fn type_error(expected: Ty, found: &Value, span: Span) -> Control {
+    Control::Raise(RuntimeError::TypeError {
+        expected,
+        found: type_of(found),
+        span,
+    })
+}
+
+fn expect_int(value: Value, span: Span) -> Result<i64, Control> {
+    match value {
+        Value::Int(number) => Ok(number),
+        bad => Err(type_error(Ty::int(), &bad, span)),
+    }
+}
+
+fn expect_bool(value: Value, span: Span) -> Result<bool, Control> {
+    match value {
+        Value::Bool(boolean) => Ok(boolean),
+        bad => Err(type_error(Ty::bool(), &bad, span)),
+    }
+}
+
+/// Apply an eager operator after both operands have evaluated successfully.
+fn eval_binary(op: BinOp, left: Value, right: Value, span: Span) -> Result<Value, Control> {
+    match op {
+        BinOp::Add
+        | BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::Mod
+        | BinOp::Lt
+        | BinOp::Le
+        | BinOp::Gt
+        | BinOp::Ge => {
+            let left = expect_int(left, span)?;
+            let right = expect_int(right, span)?;
+            if matches!(op, BinOp::Div | BinOp::Mod) && right == 0 {
+                return Err(Control::Raise(RuntimeError::DivByZero { span }));
+            }
+            Ok(match op {
+                BinOp::Add => Value::Int(left.wrapping_add(right)),
+                BinOp::Sub => Value::Int(left.wrapping_sub(right)),
+                BinOp::Mul => Value::Int(left.wrapping_mul(right)),
+                BinOp::Div => Value::Int(left.wrapping_div(right)),
+                BinOp::Mod => Value::Int(left.wrapping_rem(right)),
+                BinOp::Lt => Value::Bool(left < right),
+                BinOp::Le => Value::Bool(left <= right),
+                BinOp::Gt => Value::Bool(left > right),
+                BinOp::Ge => Value::Bool(left >= right),
+                _ => unreachable!("integer operators are matched above"),
+            })
+        }
+        BinOp::Eq => Ok(Value::Bool(left == right)),
+        BinOp::Ne => Ok(Value::Bool(left != right)),
+        BinOp::Concat => match (left, right) {
+            (Value::Str(left), Value::Str(right)) => {
+                Ok(Value::Str(Rc::from(format!("{left}{right}"))))
+            }
+            (Value::List(left), Value::List(right)) => Ok(Value::List(left.concat(&right))),
+            (Value::Str(_), bad) => Err(type_error(Ty::str(), &bad, span)),
+            (Value::List(_), bad) => Err(type_error(Ty::list(Ty::unit()), &bad, span)),
+            (bad, _) => Err(type_error(Ty::str(), &bad, span)),
+        },
+        BinOp::Cons => match right {
+            Value::List(tail) => Ok(Value::List(List::cons(left, tail))),
+            bad => Err(type_error(Ty::list(Ty::unit()), &bad, span)),
+        },
+        BinOp::And | BinOp::Or => unreachable!("short-circuit operators are handled in eval_expr"),
     }
 }

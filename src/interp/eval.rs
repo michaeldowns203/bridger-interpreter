@@ -29,7 +29,7 @@
 
 use super::{type_of, Interpreter, RuntimeError};
 use super::{Control, Env, Value};
-use crate::ast::{BinOp, Expr, Lit, Span, Ty, UnOp};
+use crate::ast::{BinOp, Expr, Lit, Span, Stmt, Ty, UnOp};
 use crate::interp::value::List;
 use std::rc::Rc;
 
@@ -98,8 +98,33 @@ impl Interpreter {
             }
 
             // ---- M2: binding ----
-            Expr::Var(..) => todo_m2!("E-Var"),
-            Expr::Block(..) => todo_m2!("E-Block / E-Let / E-Seq"),
+            Expr::Var(name, span) => match env.lookup(name) {
+                Some(value) => Ok(value),
+                None => Err(Control::Raise(RuntimeError::UnboundVariable {
+                    name: name.clone(),
+                    span: *span,
+                })),
+            },
+            Expr::Block(stmts, tail, _) => {
+                let mut local_env = env.clone();
+
+                for stmt in stmts {
+                    match stmt {
+                        Stmt::Let(name, _type, expr, _span) => {
+                            local_env =
+                                local_env.extend(name.clone(), self.eval_expr(expr, &local_env)?);
+                        }
+                        Stmt::Expr(expr) => {
+                            self.eval_expr(expr, &local_env)?;
+                        }
+                    };
+                }
+
+                match tail {
+                    Some(tail) => self.eval_expr(tail, &local_env),
+                    None => Ok(Value::Unit),
+                }
+            }
 
             // ---- M3: state & control ----
             Expr::If(..) => todo_m3!("E-If"),

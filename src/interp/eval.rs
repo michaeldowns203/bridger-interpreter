@@ -52,8 +52,14 @@ impl Interpreter {
                     self.eval_expr(expr, env)?,
                     *span,
                 )?)),
-                UnOp::Ref => todo_m3!("E-Ref"),
-                UnOp::Deref => todo_m3!("E-Deref"),
+                UnOp::Ref => {
+                    let value = self.eval_expr(expr, env)?;
+                    Ok(Value::Ref(self.store.alloc(value)))
+                }
+                UnOp::Deref => match self.eval_expr(expr, env)? {
+                    Value::Ref(loc) => Ok(self.store.read(loc)),
+                    bad => Err(type_error(Ty::reference(Ty::unit()), &bad, *span)),
+                },
             },
             Expr::Binary(bin_op, expr1, expr2, span) => {
                 let left = self.eval_expr(expr1, env)?;
@@ -110,7 +116,7 @@ impl Interpreter {
 
                 for stmt in stmts {
                     match stmt {
-                        Stmt::Let(name, _type, expr, _span) => {
+                        Stmt::Let(name, _, expr, _) => {
                             local_env =
                                 local_env.extend(name.clone(), self.eval_expr(expr, &local_env)?);
                         }
@@ -127,11 +133,41 @@ impl Interpreter {
             }
 
             // ---- M3: state & control ----
-            Expr::If(..) => todo_m3!("E-If"),
-            Expr::While(..) => todo_m3!("E-While"),
-            Expr::For(..) => todo_m3!("E-For"),
-            Expr::Assign(..) => todo_m3!("E-Assign"),
-            Expr::Return(..) => todo_m3!("E-Return"),
+            Expr::If(cond, then_br, else_br, span) => {
+                let cond_value = expect_bool(self.eval_expr(cond, env)?, *span)?;
+                if cond_value {
+                    self.eval_expr(then_br, env)
+                } else {
+                    match else_br {
+                        Some(else_br) => self.eval_expr(else_br, env),
+                        None => Ok(Value::Unit),
+                    }
+                }
+            }
+            Expr::While(cond, body, span) => loop {
+                let cond_value = expect_bool(self.eval_expr(cond, env)?, *span)?;
+                if !cond_value {
+                    break Ok(Value::Unit);
+                }
+                self.eval_expr(body, env)?;
+            },
+            Expr::For(name, itr, body, span) => {
+                let itr_value = expect_list(self.eval_expr(itr, env)?, *span)?;
+                for item in &itr_value {
+                    let local_env = env.extend(name.clone(), item.clone());
+                    self.eval_expr(body, &local_env)?;
+                }
+                Ok(Value::Unit)
+            }
+            Expr::Assign(target, expr, span) => match self.eval_expr(target, env)? {
+                Value::Ref(loc) => {
+                    let value = self.eval_expr(expr, env)?;
+                    self.store.write(loc, value);
+                    Ok(Value::Unit)
+                }
+                bad => Err(type_error(Ty::reference(Ty::unit()), &bad, *span)),
+            },
+            Expr::Return(expr, _) => Err(Control::Return(self.eval_expr(expr, env)?)),
 
             // ---- M4: functions ----
             Expr::Lambda(..) => todo_m4!("E-Lam"),
@@ -182,6 +218,13 @@ fn expect_bool(value: Value, span: Span) -> Result<bool, Control> {
     match value {
         Value::Bool(boolean) => Ok(boolean),
         bad => Err(type_error(Ty::bool(), &bad, span)),
+    }
+}
+
+fn expect_list(value: Value, span: Span) -> Result<List, Control> {
+    match value {
+        Value::List(list) => Ok(list),
+        bad => Err(type_error(Ty::list(Ty::unit()), &bad, span)),
     }
 }
 

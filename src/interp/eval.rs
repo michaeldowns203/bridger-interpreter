@@ -27,7 +27,7 @@
 //! span the checker recorded it at (`Checker::record_conversion`), or a `?`
 //! quietly passes its payload through unconverted.
 
-use super::{type_of, Interpreter, RuntimeError};
+use super::{type_of, Closure, Interpreter, RuntimeError};
 use super::{Control, Env, Value};
 use crate::ast::{BinOp, Expr, Lit, Span, Stmt, Ty, UnOp};
 use crate::interp::value::List;
@@ -170,8 +170,54 @@ impl Interpreter {
             Expr::Return(expr, _) => Err(Control::Return(self.eval_expr(expr, env)?)),
 
             // ---- M4: functions ----
-            Expr::Lambda(..) => todo_m4!("E-Lam"),
-            Expr::Call(..) => todo_m4!("E-App (dispatch Bridger vs. Native closure)"),
+            Expr::Lambda(params, body, _) => Ok(Value::Closure(Rc::from(Closure::Bridger {
+                params: params.iter().map(|param| param.name.clone()).collect(),
+                body: body.as_ref().clone(),
+                env: env.clone(),
+            }))),
+            Expr::Call(operator, args, span) => match self.eval_expr(operator, env)? {
+                Value::Closure(closure) => {
+                    let arg_values = self.eval_elements(args, env)?;
+                    match closure.as_ref() {
+                        Closure::Native(builtin) => self
+                            .eval_prelude(*builtin, arg_values, *span)
+                            .map_err(Control::Raise),
+                        Closure::Bridger {
+                            params,
+                            body,
+                            env: captured_env,
+                        } => {
+                            if arg_values.len() != params.len() {
+                                return Err(Control::Raise(RuntimeError::ArityMismatch {
+                                    expected: params.len(),
+                                    found: arg_values.len(),
+                                    span: *span,
+                                }));
+                            }
+
+                            let mut local_env = captured_env.clone();
+                            for (params, arg_values) in params.iter().zip(arg_values) {
+                                local_env = local_env.extend(params.clone(), arg_values);
+                            }
+
+                            self.enter_call(*span).map_err(Control::Raise)?;
+                            let outcome = self.eval_expr(body, &local_env);
+                            self.leave_call();
+                            match outcome {
+                                Ok(value) => Ok(value),
+                                Err(control) => match control {
+                                    Control::Return(value) => Ok(value),
+                                    Control::Raise(error) => Err(Control::from(error)),
+                                },
+                            }
+                        }
+                    }
+                }
+                bad => Err(Control::Raise(RuntimeError::NotAFunction {
+                    found: type_of(&bad),
+                    span: *span,
+                })),
+            },
 
             // ---- M6: relations (queries go through `self.solutions`, engine.rs) ----
             Expr::Relation(..) => todo_m6!("E-Add / E-Clear / E-Solutions / E-Query"),
@@ -228,6 +274,16 @@ fn expect_list(value: Value, span: Span) -> Result<List, Control> {
     }
 }
 
+fn expect_not_closure(value: &Value, span: Span) -> Result<(), Control> {
+    match value {
+        Value::Closure(_) => Err(Control::Raise(RuntimeError::NotComparable {
+            found: type_of(value),
+            span,
+        })),
+        _ => Ok(()),
+    }
+}
+
 /// Apply an eager operator after both operands have evaluated successfully.
 fn eval_binary(op: BinOp, left: Value, right: Value, span: Span) -> Result<Value, Control> {
     match op {
@@ -258,8 +314,15 @@ fn eval_binary(op: BinOp, left: Value, right: Value, span: Span) -> Result<Value
                 _ => unreachable!("integer operators are matched above"),
             })
         }
-        BinOp::Eq => Ok(Value::Bool(left == right)),
-        BinOp::Ne => Ok(Value::Bool(left != right)),
+        BinOp::Eq | BinOp::Ne => {
+            expect_not_closure(&left, span)?;
+            expect_not_closure(&right, span)?;
+            Ok(match op {
+                BinOp::Eq => Value::Bool(left == right),
+                BinOp::Ne => Value::Bool(left != right),
+                _ => unreachable!("equality operators are matched above"),
+            })
+        }
         BinOp::Concat => match (left, right) {
             (Value::Str(left), Value::Str(right)) => {
                 Ok(Value::Str(Rc::from(format!("{left}{right}"))))

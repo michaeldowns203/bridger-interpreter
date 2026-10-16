@@ -28,7 +28,7 @@
 //! quietly passes its payload through unconverted.
 
 use super::{type_of, Closure, Interpreter, RuntimeError};
-use super::{Control, Env, Value};
+use super::{Control, Env, Loc, Value};
 use crate::ast::{BinOp, Expr, Lit, Span, Stmt, Ty, UnOp};
 use crate::interp::value::{uncomparable, List};
 use std::rc::Rc;
@@ -56,10 +56,10 @@ impl Interpreter {
                     let value = self.eval_expr(expr, env)?;
                     Ok(Value::Ref(self.store.alloc(value)))
                 }
-                UnOp::Deref => match self.eval_expr(expr, env)? {
-                    Value::Ref(loc) => Ok(self.store.read(loc)),
-                    bad => Err(type_error(Ty::reference(Ty::unit()), &bad, *span)),
-                },
+                UnOp::Deref => {
+                    let loc = expect_ref(self.eval_expr(expr, env)?, *span)?;
+                    Ok(self.store.read(loc))
+                }
             },
             Expr::Binary(bin_op, expr1, expr2, span) => {
                 let left = self.eval_expr(expr1, env)?;
@@ -104,13 +104,12 @@ impl Interpreter {
             }
 
             // ---- M2: binding ----
-            Expr::Var(name, span) => match env.lookup(name) {
-                Some(value) => Ok(value),
-                None => Err(Control::Raise(RuntimeError::UnboundVariable {
+            Expr::Var(name, span) => env.lookup(name).ok_or_else(|| {
+                Control::Raise(RuntimeError::UnboundVariable {
                     name: name.clone(),
                     span: *span,
-                })),
-            },
+                })
+            }),
             Expr::Block(stmts, tail, _) => {
                 let mut local_env = env.clone();
 
@@ -159,14 +158,12 @@ impl Interpreter {
                 }
                 Ok(Value::Unit)
             }
-            Expr::Assign(target, expr, span) => match self.eval_expr(target, env)? {
-                Value::Ref(loc) => {
-                    let value = self.eval_expr(expr, env)?;
-                    self.store.write(loc, value);
-                    Ok(Value::Unit)
-                }
-                bad => Err(type_error(Ty::reference(Ty::unit()), &bad, *span)),
-            },
+            Expr::Assign(target, expr, span) => {
+                let loc = expect_ref(self.eval_expr(target, env)?, *span)?;
+                let value = self.eval_expr(expr, env)?;
+                self.store.write(loc, value);
+                Ok(Value::Unit)
+            }
             Expr::Return(expr, _) => Err(Control::Return(self.eval_expr(expr, env)?)),
 
             // ---- M4: functions ----
@@ -274,10 +271,17 @@ fn expect_list(value: Value, span: Span) -> Result<List, Control> {
     }
 }
 
+fn expect_ref(value: Value, span: Span) -> Result<Loc, Control> {
+    match value {
+        Value::Ref(loc) => Ok(loc),
+        bad => Err(type_error(Ty::reference(Ty::unit()), &bad, span)),
+    }
+}
+
 fn expect_comparable(value: &Value, span: Span) -> Result<(), Control> {
     match uncomparable(value) {
         Some(found) => Err(Control::Raise(RuntimeError::NotComparable { found, span })),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -329,10 +333,10 @@ fn eval_binary(op: BinOp, left: Value, right: Value, span: Span) -> Result<Value
             (Value::List(_), bad) => Err(type_error(Ty::list(Ty::unit()), &bad, span)),
             (bad, _) => Err(type_error(Ty::str(), &bad, span)),
         },
-        BinOp::Cons => match right {
-            Value::List(tail) => Ok(Value::List(List::cons(left, tail))),
-            bad => Err(type_error(Ty::list(Ty::unit()), &bad, span)),
-        },
+        BinOp::Cons => {
+            let tail = expect_list(right, span)?;
+            Ok(Value::List(List::cons(left, tail)))
+        }
         BinOp::And | BinOp::Or => unreachable!("short-circuit operators are handled in eval_expr"),
     }
 }

@@ -30,7 +30,7 @@
 use super::{type_of, Closure, Interpreter, RuntimeError};
 use super::{Control, Env, Value};
 use crate::ast::{BinOp, Expr, Lit, Span, Stmt, Ty, UnOp};
-use crate::interp::value::List;
+use crate::interp::value::{uncomparable, List};
 use std::rc::Rc;
 
 impl Interpreter {
@@ -274,12 +274,9 @@ fn expect_list(value: Value, span: Span) -> Result<List, Control> {
     }
 }
 
-fn expect_not_closure(value: &Value, span: Span) -> Result<(), Control> {
-    match value {
-        Value::Closure(_) => Err(Control::Raise(RuntimeError::NotComparable {
-            found: type_of(value),
-            span,
-        })),
+fn expect_comparable(value: &Value, span: Span) -> Result<(), Control> {
+    match uncomparable(value) {
+        Some(found) => Err(Control::Raise(RuntimeError::NotComparable { found, span })),
         _ => Ok(()),
     }
 }
@@ -315,8 +312,8 @@ fn eval_binary(op: BinOp, left: Value, right: Value, span: Span) -> Result<Value
             })
         }
         BinOp::Eq | BinOp::Ne => {
-            expect_not_closure(&left, span)?;
-            expect_not_closure(&right, span)?;
+            expect_comparable(&left, span)?;
+            expect_comparable(&right, span)?;
             Ok(match op {
                 BinOp::Eq => Value::Bool(left == right),
                 BinOp::Ne => Value::Bool(left != right),

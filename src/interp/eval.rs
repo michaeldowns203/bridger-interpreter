@@ -176,8 +176,8 @@ impl Interpreter {
                 Value::Closure(closure) => {
                     let arg_values = self.eval_elements(args, env)?;
                     match closure.as_ref() {
-                        Closure::Native(builtin) => self
-                            .eval_prelude(*builtin, arg_values, *span)
+                        Closure::Native(builtin_id) => self
+                            .eval_prelude(*builtin_id, arg_values, *span)
                             .map_err(Control::Raise),
                         Closure::Bridger {
                             params,
@@ -193,8 +193,8 @@ impl Interpreter {
                             }
 
                             let mut local_env = captured_env.clone();
-                            for (params, arg_values) in params.iter().zip(arg_values) {
-                                local_env = local_env.extend(params.clone(), arg_values);
+                            for (param, arg_value) in params.iter().zip(arg_values) {
+                                local_env = local_env.extend(param.clone(), arg_value);
                             }
 
                             self.enter_call(*span).map_err(Control::Raise)?;

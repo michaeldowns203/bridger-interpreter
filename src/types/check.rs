@@ -30,7 +30,7 @@
 
 use super::{contains_meta, Checker, Ctx, TyError, MAX_NESTING};
 use crate::ast::{BinOp, Decl, Expr, Lit, Rule, Span, Stmt, Ty, TyKind, UnOp};
-use std::collections::{HashSet};
+use std::collections::HashSet;
 
 impl Checker {
     /// The type of `e` in context `ctx`, checked against `expected` when one

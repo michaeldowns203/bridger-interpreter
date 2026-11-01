@@ -18,7 +18,7 @@
 //! Where a rule needs two types to agree, call [`Checker::unify`] rather than
 //! comparing with `==`: an unannotated `let`, a lambda parameter, an empty
 //! list, or `deref` of a not-yet-known reference gets a
-//! [`TyKind::Meta`](crate::ast::TyKind::Meta), and the same `unify` call that
+//! [`TyKind::Meta`](TyKind::Meta), and the same `unify` call that
 //! compares two known types solves it.
 //!
 //! A few choices the checker makes cannot be recovered at run time, so it hands
@@ -28,8 +28,9 @@
 //! ambiguous (both M8). Record at the same span the evaluator looks up, or the
 //! choice is silently lost.
 
-use super::{Checker, Ctx, TyError};
-use crate::ast::{Expr, Rule, Span, Ty};
+use super::{contains_meta, Checker, Ctx, TyError, MAX_NESTING};
+use crate::ast::{BinOp, Decl, Expr, Lit, Rule, Span, Stmt, Ty, TyKind, UnOp};
+use std::collections::{HashSet};
 
 impl Checker {
     /// The type of `e` in context `ctx`, checked against `expected` when one
@@ -40,30 +41,382 @@ impl Checker {
         ctx: &Ctx,
         expected: Option<&Ty>,
     ) -> Result<Ty, TyError> {
-        // `ctx` and `expected` are read by the arms you write; this line only
-        // keeps the unused-variable lint quiet until then.
-        let _ = (ctx, expected);
+        if self.depth >= MAX_NESTING {
+            return Err(TyError::TooDeep {
+                limit: MAX_NESTING,
+                span: e.span(),
+            });
+        }
+        self.depth += 1;
+        let result = self.check_expr_inner(e, ctx, expected);
+        self.depth -= 1;
+        result
+    }
+
+    /// Check the expression’s inferred type against the type required by its context, then resolve and record it.
+    fn finish_expr(&mut self, ty: Ty, expected: Option<&Ty>, span: Span) -> Result<Ty, TyError> {
+        if let Some(exp) = expected {
+            self.unify(&ty, exp, span)?;
+        }
+        let ty = self.resolve(&ty);
+        self.record(span, ty.clone());
+        Ok(ty)
+    }
+
+    fn check_expr_inner(
+        &mut self,
+        e: &Expr,
+        ctx: &Ctx,
+        expected: Option<&Ty>,
+    ) -> Result<Ty, TyError> {
         match e {
             // ---- M5: the checker over M1–M4's expressions ----
-            Expr::Lit(..) => todo_m5!("T-Int / T-Bool / T-Str / T-Unit"),
-            Expr::Var(..) => todo_m5!("T-Var / T-Self"),
-            Expr::Unary(..) => todo_m5!("T-Neg / T-Not / T-Ref / T-Deref"),
-            Expr::Binary(..) => {
-                todo_m5!("T-Arith / T-Ord / T-Eq / T-And / T-Or / T-Concat / T-Cons")
+            Expr::Lit(lit, span) => {
+                let ty = match lit {
+                    Lit::Int(_) => Ty::int(),
+                    Lit::Bool(_) => Ty::bool(),
+                    Lit::Str(_) => Ty::str(),
+                    Lit::Unit => Ty::unit(),
+                };
+                self.finish_expr(ty, expected, *span)
             }
-            Expr::Tuple(..) => todo_m5!("T-Tuple"),
-            Expr::List(..) => todo_m5!("T-List"),
-            Expr::Proj(..) => todo_m5!("T-Proj"),
-            Expr::Block(..) => todo_m5!("T-Block / T-Let / T-Seq"),
-            Expr::If(..) => todo_m5!("T-If"),
-            Expr::While(..) => todo_m5!("T-While"),
-            Expr::For(..) => todo_m5!("T-For"),
-            Expr::Assign(..) => todo_m5!("T-Assign"),
-            Expr::Return(..) => todo_m5!("T-Return (reads ctx.ret())"),
-            Expr::Lambda(..) => {
-                todo_m5!("T-Lam (parameter types from `expected`, the annotation, or a fresh meta)")
+            Expr::Var(name, span) => {
+                let ty = if let Some(ty) = ctx.lookup(name) {
+                    ty
+                } else if let Some(Decl::Fn(generics, params, ret, _)) = self.decl(name) {
+                    let generics = generics.clone();
+                    let sig = Ty::func(
+                        params.iter().map(|param| param.ty.clone()).collect(),
+                        ret.clone(),
+                    );
+                    let sub = generics
+                        .params
+                        .iter()
+                        .map(|param| (param.name.clone(), self.fresh_meta()))
+                        .collect();
+                    for param in &generics.params {
+                        if let Some(bound) = &param.bound {
+                            let mut bound = bound.clone();
+                            bound.args =
+                                bound.args.iter().map(|arg| arg.substitute(&sub)).collect();
+                            self.require_trait(bound, sub[&param.name].clone(), *span);
+                        }
+                    }
+                    sig.substitute(&sub)
+                } else if let Some(ty) = self.global_type(name) {
+                    ty?
+                } else if let Some(ty) = self.native_fn_type(name, *span) {
+                    ty
+                } else {
+                    return Err(TyError::UnboundVariable {
+                        name: name.clone(),
+                        span: *span,
+                    });
+                };
+                self.finish_expr(ty, expected, *span)
             }
-            Expr::Call(..) => todo_m5!("T-App (first-order matching of generics at the call)"),
+            Expr::Unary(op, e, span) => {
+                let ty = match op {
+                    UnOp::Neg => {
+                        self.check_expr(e, ctx, Some(&Ty::int()))?;
+                        Ty::int()
+                    }
+                    UnOp::Not => {
+                        self.check_expr(e, ctx, Some(&Ty::bool()))?;
+                        Ty::bool()
+                    }
+                    UnOp::Ref => {
+                        let t = self.check_expr(e, ctx, None)?;
+                        Ty::reference(t)
+                    }
+                    UnOp::Deref => {
+                        let t = self.fresh_meta();
+                        self.check_expr(e, ctx, Some(&Ty::reference(t.clone())))?;
+                        t
+                    }
+                };
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Binary(op, e1, e2, span) => {
+                let ty = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                        self.check_expr(e1, ctx, Some(&Ty::int()))?;
+                        self.check_expr(e2, ctx, Some(&Ty::int()))?;
+                        Ty::int()
+                    }
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        self.check_expr(e1, ctx, Some(&Ty::int()))?;
+                        self.check_expr(e2, ctx, Some(&Ty::int()))?;
+                        Ty::bool()
+                    }
+                    BinOp::And | BinOp::Or => {
+                        self.check_expr(e1, ctx, Some(&Ty::bool()))?;
+                        self.check_expr(e2, ctx, Some(&Ty::bool()))?;
+                        Ty::bool()
+                    }
+                    BinOp::Eq | BinOp::Ne => {
+                        let t = self.check_expr(e1, ctx, None)?;
+                        self.check_expr(e2, ctx, Some(&t))?;
+                        let t = self.resolve(&t);
+                        if contains_meta(&t) {
+                            self.require_bound("Eq".to_string(), t, *span);
+                        } else if !self.admits_eq(&t, &mut HashSet::new()) {
+                            return Err(TyError::NoEquality {
+                                is_param: self.is_type_param(&t),
+                                ty: t,
+                                span: *span,
+                            });
+                        }
+                        Ty::bool()
+                    }
+                    BinOp::Concat => {
+                        let t = self.check_expr(e1, ctx, None)?;
+                        let t = self.resolve(&t);
+                        if !matches!(t.kind, TyKind::Str | TyKind::List(_) | TyKind::Meta(_)) {
+                            return Err(TyError::Mismatch {
+                                expected: Ty::str(),
+                                found: t,
+                                span: e1.span(),
+                            });
+                        }
+                        self.check_expr(e2, ctx, Some(&t))?;
+                        let ty = self.resolve(&t);
+                        match &ty.kind {
+                            TyKind::Str | TyKind::List(_) => ty,
+                            TyKind::Meta(_) => return Err(TyError::Ambiguous { span: *span }),
+                            _ => {
+                                return Err(TyError::Mismatch {
+                                    expected: Ty::str(),
+                                    found: ty,
+                                    span: e2.span(),
+                                });
+                            }
+                        }
+                    }
+                    BinOp::Cons => {
+                        let t = self.check_expr(e1, ctx, None)?;
+                        let list_ty = Ty::list(t);
+                        self.check_expr(e2, ctx, Some(&list_ty))?;
+                        list_ty
+                    }
+                };
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Tuple(es, span) => {
+                let exp = expected.map(|ty| self.resolve(ty));
+                let expected_ts = match exp.as_ref().map(|ty| &ty.kind) {
+                    Some(TyKind::Tuple(ts)) if ts.len() == es.len() => Some(ts),
+                    _ => None,
+                };
+                let mut ts = Vec::with_capacity(es.len());
+                for (i, e) in es.iter().enumerate() {
+                    let expected_t = expected_ts.map(|ts| &ts[i]);
+                    ts.push(self.check_expr(e, ctx, expected_t)?);
+                }
+                let ty = Ty::tuple(ts);
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::List(es, span) => {
+                let exp = expected.map(|ty| self.resolve(ty));
+                let t = match exp.as_ref().map(|ty| &ty.kind) {
+                    Some(TyKind::List(t)) => (**t).clone(),
+                    _ => self.fresh_meta(),
+                };
+                for e in es {
+                    self.check_expr(e, ctx, Some(&t))?;
+                }
+                let ty = Ty::list(t);
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Proj(e, index, span) => {
+                let t = self.check_expr(e, ctx, None)?;
+                let t = self.resolve(&t);
+                let ty = match &t.kind {
+                    TyKind::Tuple(ts) => {
+                        ts.get(*index as usize)
+                            .cloned()
+                            .ok_or(TyError::NoSuchComponent {
+                                index: *index,
+                                arity: ts.len(),
+                                span: *span,
+                            })?
+                    }
+                    TyKind::Meta(_) => self.undetermined(*span)?,
+                    _ => {
+                        return Err(TyError::NotATuple {
+                            index: *index,
+                            found: t,
+                            span: *span,
+                        });
+                    }
+                };
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Block(stmts, tail, span) => {
+                let mut cx = ctx.clone();
+                let mut leaves = false;
+                for stmt in stmts {
+                    let (e, at) = match stmt {
+                        Stmt::Let(name, annotation, init, at) => {
+                            let ty = if let Some(annotation) = annotation {
+                                let ty = self.annotation(annotation, &cx, *at)?;
+                                self.check_expr(init, &cx, Some(&ty))?;
+                                ty
+                            } else {
+                                self.check_expr(init, &cx, None)?
+                            };
+                            cx = cx.extend(name.clone(), ty);
+                            (init, *at)
+                        }
+                        Stmt::Expr(e) => {
+                            self.check_expr(e, &cx, None)?;
+                            (e, e.span())
+                        }
+                    };
+                    if !leaves && self.is_diverging(e.span()) {
+                        leaves = true;
+                        self.dead_after(at, *span);
+                    }
+                }
+                let ty = match tail {
+                    Some(e) => self.check_expr(e, &cx, expected)?,
+                    None if leaves => self.fresh_meta(),
+                    None => Ty::unit(),
+                };
+                if tail.as_ref().is_some_and(|e| self.is_diverging(e.span())) {
+                    self.record_diverging(*span);
+                }
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::If(cond, then, els, span) => {
+                self.check_expr(cond, ctx, Some(&Ty::bool()))?;
+                if self.is_diverging(cond.span()) {
+                    self.dead_after(cond.span(), *span);
+                }
+                let t = if let Some(e) = els {
+                    let t = self.check_expr(then, ctx, expected)?;
+                    self.check_expr(e, ctx, Some(&t))?;
+                    if self.is_diverging(then.span()) && self.is_diverging(e.span()) {
+                        self.record_diverging(*span);
+                    }
+                    t
+                } else {
+                    let t = self.check_expr(then, ctx, None)?;
+                    self.unify(&t, &Ty::unit(), then.span()).map_err(|_| {
+                        TyError::IfWithoutElse {
+                            found: self.resolve(&t),
+                            span: then.span(),
+                        }
+                    })?;
+                    Ty::unit()
+                };
+                self.finish_expr(t, expected, *span)
+            }
+            Expr::While(cond, body, span) => {
+                self.check_expr(cond, ctx, Some(&Ty::bool()))?;
+                if self.is_diverging(cond.span()) {
+                    self.dead_after(cond.span(), *span);
+                }
+                self.check_expr(body, ctx, Some(&Ty::unit()))?;
+                self.finish_expr(Ty::unit(), expected, *span)
+            }
+            Expr::For(name, iter, body, span) => {
+                let t = self.fresh_meta();
+                self.check_expr(iter, ctx, Some(&Ty::list(t.clone())))?;
+                if self.is_diverging(iter.span()) {
+                    self.dead_after(iter.span(), *span);
+                }
+                let cx = ctx.extend(name.clone(), t);
+                self.check_expr(body, &cx, Some(&Ty::unit()))?;
+                self.finish_expr(Ty::unit(), expected, *span)
+            }
+            Expr::Assign(e1, e2, span) => {
+                let t = self.fresh_meta();
+                self.check_expr(e1, ctx, Some(&Ty::reference(t.clone())))?;
+                self.check_expr(e2, ctx, Some(&t))?;
+                self.finish_expr(Ty::unit(), expected, *span)
+            }
+            Expr::Return(e, span) => {
+                let ret = ctx
+                    .ret()
+                    .ok_or(TyError::ReturnOutsideFunction { span: *span })?;
+                self.check_expr(e, ctx, Some(&ret))?;
+                self.record_diverging(*span);
+                let ty = self.fresh_meta();
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Lambda(params, body, span) => {
+                let exp = expected.map(|ty| self.resolve(ty));
+                let expected_fn = match exp.as_ref().map(|ty| &ty.kind) {
+                    Some(TyKind::Fn(param_tys, ret)) if param_tys.len() == params.len() => {
+                        Some((param_tys, ret))
+                    }
+                    _ => None,
+                };
+                let ret_ty = expected_fn
+                    .map(|(_, ret)| (**ret).clone())
+                    .unwrap_or_else(|| self.fresh_meta());
+                let mut cx = ctx.enter(Some(ret_ty.clone()), ctx.self_ty());
+                let mut param_tys = Vec::with_capacity(params.len());
+                for (i, param) in params.iter().enumerate() {
+                    let ty = if let Some(annotation) = &param.ty {
+                        self.annotation(annotation, ctx, param.span)?
+                    } else if let Some((expected_ps, _)) = expected_fn {
+                        expected_ps[i].clone()
+                    } else {
+                        self.fresh_meta()
+                    };
+                    cx = cx.extend(param.name.clone(), ty.clone());
+                    param_tys.push(ty);
+                }
+                self.check_expr(body, &cx, Some(&ret_ty))?;
+                let ty = Ty::func(
+                    param_tys.iter().map(|ty| self.resolve(ty)).collect(),
+                    self.resolve(&ret_ty),
+                );
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::Call(f, args, span) => {
+                let (f_ty, bounds) = self.check_callee(f, ctx)?;
+                let ty = match &f_ty.kind {
+                    TyKind::Fn(param_tys, ret) => {
+                        if param_tys.len() != args.len() {
+                            return Err(TyError::ArityMismatch {
+                                callee: match &**f {
+                                    Expr::Var(name, _) => name.clone(),
+                                    _ => "this function".to_string(),
+                                },
+                                expected: param_tys.len(),
+                                found: args.len(),
+                                span: *span,
+                            });
+                        }
+                        for (arg, param_ty) in args.iter().zip(param_tys.iter()) {
+                            self.check_expr(arg, ctx, Some(param_ty))?;
+                        }
+                        self.finish_call(bounds, param_tys, args, *span);
+                        (**ret).clone()
+                    }
+                    TyKind::Meta(_) => {
+                        let mut param_tys = Vec::with_capacity(args.len());
+                        for arg in args {
+                            param_tys.push(self.check_expr(arg, ctx, None)?);
+                        }
+                        let ret = self.fresh_meta();
+                        let fn_ty = Ty::func(param_tys.clone(), ret.clone());
+                        self.unify(&f_ty, &fn_ty, *span)?;
+                        self.finish_call(bounds, &param_tys, args, *span);
+                        ret
+                    }
+                    _ => {
+                        return Err(TyError::NotAFunction {
+                            found: f_ty,
+                            span: f.span(),
+                        });
+                    }
+                };
+                self.finish_expr(ty, expected, *span)
+            }
 
             // ---- M6: relations ----
             Expr::Relation(..) => todo_m6!("T-Add / T-Clear / T-Solutions / T-Query"),
@@ -86,8 +439,76 @@ impl Checker {
     /// inference variables exist it also *solves* them (`Checker::solve`),
     /// with an occurs check so no type contains itself.
     pub fn unify(&mut self, a: &Ty, b: &Ty, span: Span) -> Result<(), TyError> {
-        let _ = (a, b, span);
-        todo_m5!("unify (structural agreement; solves TyKind::Meta with an occurs check)")
+        fn occurs(id: u32, ty: &Ty) -> bool {
+            match &ty.kind {
+                TyKind::Meta(other) => id == *other,
+                TyKind::List(inner) | TyKind::Ref(inner) => occurs(id, inner),
+                TyKind::Tuple(parts) | TyKind::Named(_, parts) => {
+                    parts.iter().any(|part| occurs(id, part))
+                }
+                TyKind::Fn(params, ret) => {
+                    params.iter().any(|param| occurs(id, param)) || occurs(id, ret)
+                }
+                _ => false,
+            }
+        }
+
+        let a = self.resolve(a);
+        let b = self.resolve(b);
+
+        if a == b {
+            return Ok(());
+        }
+
+        let meta_solution = match (&a.kind, &b.kind) {
+            (TyKind::Meta(id), _) => Some((*id, &b)),
+            (_, TyKind::Meta(id)) => Some((*id, &a)),
+            _ => None,
+        };
+        if let Some((id, ty)) = meta_solution {
+            if occurs(id, ty) {
+                return Err(TyError::InfiniteType { span });
+            }
+            self.solve(id, ty.clone());
+            return Ok(());
+        }
+
+        match (&a.kind, &b.kind) {
+            (TyKind::List(found), TyKind::List(expected))
+            | (TyKind::Ref(found), TyKind::Ref(expected)) => {
+                return self.unify(found, expected, span);
+            }
+            (TyKind::Tuple(found), TyKind::Tuple(expected)) if found.len() == expected.len() => {
+                for (f, e) in found.iter().zip(expected.iter()) {
+                    self.unify(f, e, span)?;
+                }
+                return Ok(());
+            }
+            (TyKind::Fn(found_params, found_ret), TyKind::Fn(expected_params, expected_ret))
+                if found_params.len() == expected_params.len() =>
+            {
+                for (found, expected) in found_params.iter().zip(expected_params.iter()) {
+                    self.unify(found, expected, span)?;
+                }
+                return self.unify(found_ret, expected_ret, span);
+            }
+            (
+                TyKind::Named(found_name, found_args),
+                TyKind::Named(expected_name, expected_args),
+            ) if found_name == expected_name && found_args.len() == expected_args.len() => {
+                for (found, expected) in found_args.iter().zip(expected_args.iter()) {
+                    self.unify(found, expected, span)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        Err(TyError::Mismatch {
+            expected: b,
+            found: a,
+            span,
+        })
     }
 
     /// Type-check one rule (Appendix D, "Relations"): bind each generator's

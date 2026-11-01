@@ -5,7 +5,7 @@
 > lands on `total` rather than on the whole assignment, and why `expected` and `found` come out in that order, not the reverse.
 
 My `Assign` arm in [`check.rs`](src/types/check.rs) creates a fresh inference variable, assigns it to `t`, and checks the left-hand side of the assignment against `Ty::reference(t.clone())`,
-which produces the expected `ref<_>`. The `Var` arm finds `total`'s `Int` type and calls `unify` at the variable's span, so the error points at `total`.
+which produces the expected `ref<_>`. The `Var` arm finds `total`'s `Int` type and calls `finish_expr`, which invokes `unify` at the variable’s span, so the error points at `total`.
 My `unify` takes the found type first and the expected type second, then puts them into the corresponding error fields. M5 checks the program before
 evaluation, so the error prevents `start` from being printed.
 
@@ -36,7 +36,7 @@ shared type: `f(1)` constrains its input to `Int`, so `f("a")` fails.
 
 My `Lambda` arm gives `x` a fresh inference variable, say `α`. In `x(x)`, my `Call` arm sees an unknown callee, infers `α` for the argument, creates
 a fresh result `β`, and asks `unify` to equate `α` with `fn(α) -> β`. The local `occurs` helper finds `α` inside that function's parameter
-types and returns `InfiniteType` before `solve` runs. Without this check, `unify` would store a cyclic solution, and `resolve` would repeatedly
+types and returns `true`, so `unify` returns `InfiniteType` before `solve` runs. Without this check, `unify` would store a cyclic solution, and `resolve` would repeatedly
 expand the same variable until the stack overflowed.
 
 > `fn f() -> Int { return 1; let y = []; println(y); 2 }` checks, although nothing fixes the element type of `y`, while `fn f() -> Int {
@@ -44,9 +44,10 @@ expand the same variable until the stack overflowed.
 > statements are checked, and why the second program is still an error.
 
 After checking each statement, my `Block` arm detects the first diverging expression and calls `dead_after(at, *span)` before continuing
-the loop. This marks the remaining code unreachable before its expressions are checked. That order matters because the `undetermined` helper
-consults the `in_dead_code` mark during checking: without the mark, it could report `Ambiguous` immediately, before a later call to `dead_after`
-could help. The driver's later determination and bound checks also skip unreachable code, allowing `y`'s element type to remain unknown in the first
+the loop. This marks the remaining code unreachable before its expressions are checked. Marking dead code early also matters for expressions such
+as tuple projection, whose `undetermined` helper consults `in_dead_code` during checking: without the mark, it could report `Ambiguous` immediately,
+before a later call to `dead_after` could help. In the example above, the driver's later determination and bound checks skip the unreachable code,
+allowing `y`'s element type to remain unknown in the first
 program. Unreachable code is still checked for concrete type mismatches: the arithmetic arm checks `true` against `Int`, so `1 + true` still fails.
 
 ## How you implemented it
@@ -57,15 +58,17 @@ program. Unreachable code is still checked for concrete type mismatches: the ari
 > (`check_callee`, `fresh_meta`, `resolve`, `record`, `Ty::func`, `TyError`, `?`) is encouraged.
 
 My `Call` arm uses `check_callee` to obtain the resolved type and the range of bounds created for the callee. A function type requires matching arity,
-then checks arguments against parameters from left to right; `finish_call` moves each bound's error span to the argument supplying its type, or to
-the call when none does. For an unsolved callee, I infer argument types, create a result with `fresh_meta`, and unify the callee with the `Ty::func`
-built from them; anything else produces `NotAFunction` at the callee. Finally, I check the result against `expected`, resolve it, record it, and return it,
-using `?` to propagate failures.
+otherwise producing `ArityMismatch` at the whole call. With matching arity, it checks arguments against parameters from left to right.
+`finish_call` moves each bound's error span to the first argument whose corresponding parameter type contains the constrained type, or to the whole
+call if no parameter does. It updates diagnostic spans; the driver checks the bounds later. For an unsolved callee, I infer argument types, create
+a result with `fresh_meta`, and unify the callee with the `Ty::func` built from them; anything else produces `NotAFunction` at the callee.
+Finally, `finish_expr` checks the result against `expected`, resolves it, records it, and returns it, using `?` to propagate failures.
 
 My `unify` resolves both inputs first and succeeds immediately if they are equal. Next it handles an inference variable on either side, rejecting an
 occurrence inside its proposed solution before calling `solve`. Otherwise, it recursively unifies matching lists, references, tuples, functions, or named
 types, checking widths, arities, and names where needed. Recursive calls preserve found/expected order and propagate their errors, so an inner mismatch
 is reported directly; incompatible outer shapes produce `Mismatch` with the resolved inputs and supplied span.
+For example, unifying `[Int]` with `[Bool]` reports found `Int`, expected `Bool`, while preserving the span supplied to the outer call.
 
 > Describe how your `check_expr` enforces the nesting bound and keeps `self.depth` balanced when an arm fails, and whether you factored the
 > shared ending of every arm (Chk-Sub, `resolve`, `record`) into a method of your own.
@@ -77,9 +80,13 @@ I moved the expression match into `check_expr_inner` and extracted the shared ex
 > Point out anything that was tricky, a bug you fixed, or a design choice you made — and if you used an assistant, say what you had it do and how
 > you checked its work.
 
-The generic handling in my `Var` arm was tricky, especially understanding why each use of a generic function needs fresh inference variables and
-how the same substitution map connects the function's signature to its trait bounds. I also needed to understand why the signature data is cloned
-before calling `fresh_meta`: the declaration is borrowed from the checker, but allocating inference variables requires a mutable borrow.
+The generic handling in my `Var` arm was tricky, especially keeping track of what the different `params` and `args` represent. `generics.params`
+contains type parameters like `T`, while the function's `params` contains value parameters and their declared types. A trait bound's `args` contains
+types, unlike a function call's `args`, which contains expressions to check. Understanding substitution meant tracing how the map from a name like
+`T` to an inference variable replaces occurrences inside larger types, such as `[T]`, as well as in the return type and trait-bound arguments.
+I also had to distinguish substituting those bound arguments from passing the substituted type parameter itself to `require_trait` as the type that
+must satisfy the bound. Finally, I needed to understand why the generic and signature data is cloned before calling `fresh_meta`: the declaration
+is borrowed from the checker, but allocating inference variables requires a mutable borrow.
 
 I used Codex to help when I got stuck, explain Rust syntax and ownership, and review my implementation. At my request, it implemented individual
 arms and made focused changes, including extracting `finish_expr` and adding the nesting guard. I checked its explanations and changes by asking

@@ -91,3 +91,214 @@ pub fn check_guards(program: &Program) -> Result<(), RuleError> {
     let _ = program;
     todo_m7!("check_guards: every match guard in the program is pure")
 }
+
+/// Provided helpers (Milestone M6): walks over expressions that no rule
+/// describes. Paste this module at the end of the file, unchanged.
+pub mod helpers {
+    use crate::ast::{Expr, Name, QArg, Query, Rel, Stmt};
+    use std::collections::HashSet;
+
+    /// The immediate subexpressions of `e`, in source order. A query
+    /// contributes its bound arguments, never its holes.
+    pub fn subexprs(e: &Expr) -> Vec<&Expr> {
+        let mut cs: Vec<&Expr> = Vec::new();
+        match e {
+            Expr::Lit(..) | Expr::Var(..) => {}
+            Expr::Unary(_, e1, _)
+            | Expr::Field(e1, _, _)
+            | Expr::Proj(e1, _, _)
+            | Expr::Return(e1, _)
+            | Expr::Try(e1, _)
+            | Expr::Lambda(_, e1, _) => cs.push(e1),
+            Expr::Binary(_, l, r, _) | Expr::Assign(l, r, _) => {
+                cs.push(l);
+                cs.push(r);
+            }
+            Expr::If(c, t, els, _) => {
+                cs.push(c);
+                cs.push(t);
+                if let Some(e1) = els {
+                    cs.push(e1);
+                }
+            }
+            Expr::While(c, b, _) | Expr::For(_, c, b, _) => {
+                cs.push(c);
+                cs.push(b);
+            }
+            Expr::Call(f, args, _) | Expr::Method(f, _, args, _) => {
+                cs.push(f);
+                cs.extend(args.iter());
+            }
+            Expr::Tuple(es, _) | Expr::List(es, _) | Expr::Ctor(_, es, _) => {
+                cs.extend(es.iter());
+            }
+            Expr::Struct(_, fields, _) => cs.extend(fields.iter().map(|(_, e)| e)),
+            Expr::Match(scrut, arms, _) => {
+                cs.push(scrut);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        cs.push(g);
+                    }
+                    cs.push(&a.body);
+                }
+            }
+            Expr::Block(stmts, tail, _) => {
+                for s in stmts {
+                    match s {
+                        Stmt::Let(_, _, e1, _) | Stmt::Expr(e1) => cs.push(e1),
+                    }
+                }
+                if let Some(t) = tail {
+                    cs.push(t);
+                }
+            }
+            Expr::ForQuery(q, b, _) => {
+                cs.extend(query_exprs(q));
+                cs.push(b);
+            }
+            Expr::Relation(rel, _) => match rel {
+                Rel::Add(q) | Rel::Solutions(q) | Rel::Query(q) => {
+                    cs.extend(query_exprs(q));
+                }
+                Rel::Clear(_) => {}
+            },
+        }
+        cs
+    }
+
+    /// The bound arguments of a query: every argument that is not a hole.
+    pub fn query_exprs(q: &Query) -> impl Iterator<Item = &Expr> {
+        q.args.iter().filter_map(|a| match a {
+            QArg::Expr(e) => Some(e),
+            QArg::Hole(_) => None,
+        })
+    }
+
+    /// The names `e` reads and does not bind itself, each once, in order of
+    /// first appearance: every variable in value position, minus those bound
+    /// within `e` (a `let` over the rest of its block, a lambda's parameters,
+    /// a `for` variable, a relational `for`'s named holes, a pattern's
+    /// names). A direct call's callee, `f` in `f(x)`, is not counted; its
+    /// arguments are.
+    pub fn free_vars(e: &Expr) -> Vec<Name> {
+        let mut out = Vec::new();
+        free_vars_into(e, &HashSet::new(), &mut out);
+        out
+    }
+
+    fn free_vars_into(e: &Expr, bound: &HashSet<Name>, out: &mut Vec<Name>) {
+        match e {
+            Expr::Var(x, _) => {
+                if !bound.contains(x) && !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+            Expr::Call(callee, args, _) => {
+                if !matches!(&**callee, Expr::Var(..)) {
+                    free_vars_into(callee, bound, out);
+                }
+                for a in args {
+                    free_vars_into(a, bound, out);
+                }
+            }
+            Expr::Lambda(params, body, _) => {
+                let mut inner = bound.clone();
+                inner.extend(params.iter().map(|p| p.name.clone()));
+                free_vars_into(body, &inner, out);
+            }
+            Expr::Block(stmts, tail, _) => {
+                let mut inner = bound.clone();
+                for s in stmts {
+                    match s {
+                        Stmt::Let(x, _, rhs, _) => {
+                            free_vars_into(rhs, &inner, out);
+                            inner.insert(x.clone());
+                        }
+                        Stmt::Expr(e1) => free_vars_into(e1, &inner, out),
+                    }
+                }
+                if let Some(t) = tail {
+                    free_vars_into(t, &inner, out);
+                }
+            }
+            Expr::For(x, iter, body, _) => {
+                free_vars_into(iter, bound, out);
+                let mut inner = bound.clone();
+                inner.insert(x.clone());
+                free_vars_into(body, &inner, out);
+            }
+            Expr::Match(scrut, arms, _) => {
+                free_vars_into(scrut, bound, out);
+                for arm in arms {
+                    let mut inner = bound.clone();
+                    inner.extend(arm.pat.binders());
+                    if let Some(g) = &arm.guard {
+                        free_vars_into(g, &inner, out);
+                    }
+                    free_vars_into(&arm.body, &inner, out);
+                }
+            }
+            Expr::ForQuery(q, body, _) => {
+                let mut inner = bound.clone();
+                for a in &q.args {
+                    match a {
+                        QArg::Expr(e1) => free_vars_into(e1, bound, out),
+                        QArg::Hole(Some(x)) => {
+                            inner.insert(x.clone());
+                        }
+                        QArg::Hole(None) => {}
+                    }
+                }
+                free_vars_into(body, &inner, out);
+            }
+            _ => {
+                for c in subexprs(e) {
+                    free_vars_into(c, bound, out);
+                }
+            }
+        }
+    }
+
+    /// Every name bound anywhere within `e`: `let` names, lambda
+    /// parameters, `for` variables, a relational `for`'s named holes, and
+    /// the names a `match` arm's pattern binds.
+    pub fn bound_names(e: &Expr) -> HashSet<Name> {
+        let mut out = HashSet::new();
+        bound_names_into(e, &mut out);
+        out
+    }
+
+    fn bound_names_into(e: &Expr, out: &mut HashSet<Name>) {
+        match e {
+            Expr::Block(stmts, _, _) => {
+                for s in stmts {
+                    if let Stmt::Let(x, ..) = s {
+                        out.insert(x.clone());
+                    }
+                }
+            }
+            Expr::Lambda(params, _, _) => {
+                out.extend(params.iter().map(|p| p.name.clone()));
+            }
+            Expr::Match(_, arms, _) => {
+                for arm in arms {
+                    out.extend(arm.pat.binders());
+                }
+            }
+            Expr::For(x, ..) => {
+                out.insert(x.clone());
+            }
+            Expr::ForQuery(q, ..) => {
+                for a in &q.args {
+                    if let QArg::Hole(Some(x)) = a {
+                        out.insert(x.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        for c in subexprs(e) {
+            bound_names_into(c, out);
+        }
+    }
+}

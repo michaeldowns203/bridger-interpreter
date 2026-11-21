@@ -26,7 +26,27 @@ impl Subst {
     /// it; a constant must equal the fact's value. `None` if any position
     /// disagrees, or the lengths differ. `self` is unchanged either way.
     pub fn unify(&self, pattern: &[Term], fact: &[Value]) -> Option<Subst> {
-        let _ = (pattern, fact);
-        todo_m6!("Subst::unify: match terms against a ground tuple, extending the substitution")
+        if pattern.len() != fact.len() {
+            return None;
+        }
+        let mut sub = self.clone();
+        for (term, value) in pattern.iter().zip(fact) {
+            match term {
+                Term::Val(c) => {
+                    if c != value {
+                        return None;
+                    }
+                }
+                Term::Var(x) => match sub.get(x) {
+                    Some(bound) => {
+                        if bound != value {
+                            return None;
+                        }
+                    }
+                    None => sub.bind(x.clone(), value.clone()),
+                },
+            }
+        }
+        Some(sub)
     }
 }

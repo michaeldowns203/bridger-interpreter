@@ -623,7 +623,9 @@ impl Checker {
         }
         let body_ctx = vars
             .into_iter()
-            .fold(root.clone(), |intermediate_ctx, (x, ty)| intermediate_ctx.extend(x, ty));
+            .fold(root.clone(), |intermediate_ctx, (x, ty)| {
+                intermediate_ctx.extend(x, ty)
+            });
 
         let head = &rule.head;
         let column_tys = self.relation_column_tys(&head.name, &root, head.span)?;

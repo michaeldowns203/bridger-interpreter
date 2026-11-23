@@ -32,8 +32,7 @@ use super::{contains_meta, Checker, Ctx, TyError, MAX_NESTING};
 use crate::ast::{
     BinOp, Decl, Expr, Lit, Name, QArg, Query, Rel, Rule, Span, Stmt, Term, Ty, TyKind, UnOp,
 };
-use crate::interp::prelude::native_names;
-use crate::relations::check::as_generator;
+use crate::relations::check::{as_generator, is_native};
 use std::collections::HashSet;
 
 impl Checker {
@@ -697,7 +696,7 @@ impl Checker {
         match self.decl(name) {
             Some(Decl::Relation(columns)) => Ok(columns.clone()),
             Some(_) => Err(not_a_relation()),
-            None if native_names().any(|n| n == name) => Err(not_a_relation()),
+            None if is_native(name) => Err(not_a_relation()),
             None => Err(TyError::UndeclaredRelation {
                 name: name.to_string(),
                 span,

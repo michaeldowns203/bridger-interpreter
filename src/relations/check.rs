@@ -21,8 +21,42 @@
 //! grep -rn 'todo_m6!' src
 //! ```
 
+use self::helpers::{bound_names, free_vars, subexprs};
 use super::RuleError;
-use crate::ast::{Program, Rule};
+use crate::ast::{Decl, Expr, Name, Program, Rel, Rule, SrcId, Term, Ty, TyKind, UnOp};
+use crate::interp::prelude::native_names;
+use std::collections::{HashMap, HashSet};
+
+/// If `e` is a direct call to a declared relation, returns its name and
+/// unevaluated arguments. Returns `None` for any other expression.
+pub(crate) fn as_generator<'e>(program: &Program, e: &'e Expr) -> Option<(&'e Name, &'e [Expr])> {
+    match e {
+        Expr::Call(callee, args, _) => match &**callee {
+            Expr::Var(name, _) if matches!(program.decls.get(name), Some(Decl::Relation(_))) => {
+                Some((name, args.as_slice()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn is_native(name: &str) -> bool {
+    native_names().any(|n| n == name)
+}
+
+/// The variables bound by `rule`'s generators.
+fn generator_vars(program: &Program, rule: &Rule) -> HashSet<Name> {
+    rule.body
+        .iter()
+        .filter_map(|c| as_generator(program, c))
+        .flat_map(|(_, args)| args.iter())
+        .filter_map(|a| match a {
+            Expr::Var(x, _) => Some(x.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Which conjuncts of `rule` are generators: a call whose callee names a
 /// relation declared in `program`. Everything else is a filter. A generator's
@@ -30,23 +64,107 @@ use crate::ast::{Program, Rule};
 /// count must match the relation's declared arity (`Arity`); the head must
 /// name a declared relation of the right arity too.
 pub fn check_generators(program: &Program, rule: &Rule) -> Result<Vec<bool>, RuleError> {
-    let _ = (program, rule);
-    todo_m6!("check_generators: classify conjuncts; terms only; head and generator arities")
+    let head = &rule.head;
+    let head_name = head.name.clone();
+    let Some(Decl::Relation(columns)) = program.decls.get(&head_name) else {
+        return Err(RuleError::NotARelation {
+            name: head_name,
+            span: head.span,
+        });
+    };
+    let cols_len = columns.len();
+    let terms_len = head.terms.len();
+    if cols_len != terms_len {
+        return Err(RuleError::Arity {
+            name: head_name,
+            expected: cols_len,
+            found: terms_len,
+            span: head.span,
+        });
+    }
+
+    let mut generators = Vec::with_capacity(rule.body.len());
+    for conjunct in &rule.body {
+        if let Some((name, args)) = as_generator(program, conjunct) {
+            let Some(Decl::Relation(columns)) = program.decls.get(name) else {
+                unreachable!() // `as_generator` already confirmed that the declaration exists
+            };
+            let cols_len = columns.len();
+            let args_len = args.len();
+            if cols_len != args_len {
+                return Err(RuleError::Arity {
+                    name: name.clone(),
+                    expected: cols_len,
+                    found: args_len,
+                    span: conjunct.span(),
+                });
+            }
+            for arg in args {
+                if !matches!(arg, Expr::Var(..) | Expr::Lit(..)) {
+                    return Err(RuleError::ArgumentNotATerm { span: arg.span() });
+                }
+            }
+            generators.push(true);
+        } else {
+            if let Expr::Call(callee, _, span) = conjunct {
+                if let Expr::Var(name, _) = &**callee {
+                    if !matches!(
+                        program.decls.get(name),
+                        Some(Decl::Fn(..) | Decl::Global(..))
+                    ) && !is_native(name)
+                    {
+                        return Err(RuleError::NotARelation {
+                            name: name.clone(),
+                            span: *span,
+                        });
+                    }
+                }
+            }
+            generators.push(false);
+        }
+    }
+    Ok(generators)
 }
 
-/// Range restriction: every variable in the head, and every variable a
-/// filter reads, is bound by some generator of the same rule — or names a
-/// top-level definition (a global constant or a function), which every
-/// definition may refer to. A generator-bound variable shadows a top-level
-/// name; a variable bound by neither is `Unbound`. `generators` is
-/// `check_generators`'s answer for this rule.
+/// Range restriction: every head variable is bound by a generator of the
+/// same rule, or it is `Unbound` at the head. Every name a filter reads is
+/// generator-bound or names a global, a function, or a native, or it is
+/// `Unbound` at the filter. A generator-bound variable shadows a top-level
+/// name. `generators` is `check_generators`'s answer for this rule.
 pub fn check_range_restriction(
     program: &Program,
     rule: &Rule,
     generators: &[bool],
 ) -> Result<(), RuleError> {
-    let _ = (program, rule, generators);
-    todo_m6!("check_range_restriction: head and filter variables are generator-bound")
+    let vars = generator_vars(program, rule);
+
+    for term in &rule.head.terms {
+        if let Term::Var(x) = term {
+            if !vars.contains(x) {
+                return Err(RuleError::Unbound {
+                    var: x.clone(),
+                    span: rule.head.span,
+                });
+            }
+        }
+    }
+
+    let top_level = |x: &str| match program.decls.get(x) {
+        Some(Decl::Fn(..) | Decl::Global(..)) => true,
+        Some(_) => false,
+        None => is_native(x),
+    };
+    for (filter, _) in rule.body.iter().zip(generators).filter(|(_, g)| !**g) {
+        for x in free_vars(filter) {
+            if !vars.contains(&x) && !top_level(&x) {
+                return Err(RuleError::Unbound {
+                    var: x,
+                    span: filter.span(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A filter must be pure (reference, "Purity and effects"): a deterministic

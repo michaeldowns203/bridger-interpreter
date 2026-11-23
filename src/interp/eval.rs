@@ -29,9 +29,25 @@
 
 use super::{type_of, Closure, Interpreter, RuntimeError};
 use super::{Control, Env, Loc, Value};
-use crate::ast::{BinOp, Expr, Lit, Span, Stmt, Ty, UnOp};
+use crate::ast::{BinOp, Expr, Lit, Name, QArg, Query, Rel, Span, Stmt, Ty, UnOp};
 use crate::interp::value::{uncomparable, List};
+use crate::relations::engine::named_holes;
+use crate::relations::Subst;
 use std::rc::Rc;
+
+/// One solution's value from its named holes: `()` for none, the value for
+/// one, a tuple in hole order for more.
+fn solution_value(holes: &[Name], solution: &Subst) -> Value {
+    let mut values: Vec<Value> = holes
+        .iter()
+        .map(|h| solution.get(h).cloned().expect("hole bound"))
+        .collect();
+    match values.len() {
+        0 => Value::Unit,
+        1 => values.pop().unwrap(),
+        _ => Value::Tuple(Rc::from(values)),
+    }
+}
 
 impl Interpreter {
     /// Evaluate `e` in environment `env`.
@@ -210,6 +226,13 @@ impl Interpreter {
                         }
                     }
                 }
+                Value::Relation(name) => {
+                    let q = Query {
+                        name,
+                        args: args.iter().cloned().map(QArg::Expr).collect(),
+                    };
+                    Ok(Value::Bool(!self.solutions(&q, *span, env)?.is_empty()))
+                }
                 bad => Err(Control::Raise(RuntimeError::NotAFunction {
                     found: type_of(&bad),
                     span: *span,
@@ -217,8 +240,63 @@ impl Interpreter {
             },
 
             // ---- M6: relations (queries go through `self.solutions`, engine.rs) ----
-            Expr::Relation(..) => todo_m6!("E-Add / E-Clear / E-Solutions / E-Query"),
-            Expr::ForQuery(..) => todo_m6!("E-ForQuery (iterate a query's solutions)"),
+            Expr::Relation(rel, span) => match rel {
+                Rel::Add(q) => {
+                    if self.materializing {
+                        return Err(RuntimeError::QueryInFilter { span: *span }.into());
+                    }
+                    let arity = self.relation_arity(&q.name, *span, env)?;
+                    let mut tuple = Vec::with_capacity(q.args.len());
+                    for arg in &q.args {
+                        match arg {
+                            QArg::Expr(e) => tuple.push(self.eval_expr(e, env)?),
+                            QArg::Hole(_) => {
+                                return Err(RuntimeError::HoleInAdd { span: *span }.into())
+                            }
+                        }
+                    }
+                    let tuple_len = tuple.len();
+                    if tuple_len != arity {
+                        return Err(RuntimeError::ArityMismatch {
+                            expected: arity,
+                            found: tuple_len,
+                            span: *span,
+                        }
+                        .into());
+                    }
+                    self.db.add(&q.name, tuple);
+                    Ok(Value::Unit)
+                }
+                Rel::Clear(name) => {
+                    if self.materializing {
+                        return Err(RuntimeError::QueryInFilter { span: *span }.into());
+                    }
+                    self.relation_arity(name, *span, env)?;
+                    self.db.clear(name);
+                    Ok(Value::Unit)
+                }
+                Rel::Solutions(q) => {
+                    let holes = named_holes(q);
+                    let solutions = self.solutions(q, *span, env)?;
+                    Ok(Value::List(
+                        solutions
+                            .iter()
+                            .map(|s| solution_value(&holes, s))
+                            .collect(),
+                    ))
+                }
+                Rel::Query(q) => Ok(Value::Bool(!self.solutions(q, *span, env)?.is_empty())),
+            },
+            Expr::ForQuery(q, body, span) => {
+                let holes = named_holes(q);
+                for solution in self.solutions(q, *span, env)? {
+                    let local_env = holes.iter().fold(env.clone(), |e, h| {
+                        e.extend(h.clone(), solution.get(h).cloned().expect("hole bound"))
+                    });
+                    self.eval_expr(body, &local_env)?;
+                }
+                Ok(Value::Unit)
+            }
 
             // ---- M7: algebraic data types ----
             Expr::Ctor(..) => todo_m7!("E-Ctor"),

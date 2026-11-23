@@ -29,9 +29,9 @@
 
 use super::{type_of, Closure, Interpreter, RuntimeError};
 use super::{Control, Env, Loc, Value};
-use crate::ast::{BinOp, Expr, Lit, Name, QArg, Query, Rel, Span, Stmt, Ty, UnOp};
+use crate::ast::{BinOp, Expr, Name, QArg, Query, Rel, Span, Stmt, Ty, UnOp};
 use crate::interp::value::{uncomparable, List};
-use crate::relations::engine::named_holes;
+use crate::relations::engine::{lit_value, named_holes};
 use crate::relations::Subst;
 use std::rc::Rc;
 
@@ -54,12 +54,7 @@ impl Interpreter {
     pub fn eval_expr(&mut self, e: &Expr, env: &Env) -> Result<Value, Control> {
         match e {
             // ---- M1: expressions ----
-            Expr::Lit(lit, _) => match lit {
-                Lit::Int(lit) => Ok(Value::Int(*lit)),
-                Lit::Bool(lit) => Ok(Value::Bool(*lit)),
-                Lit::Str(lit) => Ok(Value::Str(Rc::from(lit.as_str()))),
-                Lit::Unit => Ok(Value::Unit),
-            },
+            Expr::Lit(lit, _) => Ok(lit_value(lit)),
             Expr::Unary(un_op, expr, span) => match un_op {
                 UnOp::Neg => Ok(Value::Int(
                     expect_int(self.eval_expr(expr, env)?, *span)?.wrapping_neg(),

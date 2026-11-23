@@ -27,6 +27,7 @@
 //!
 //! [`RelationDb`]: RelationDb
 
+use super::check::as_generator;
 use super::{RelationDb, Subst, Term, Tuple};
 use crate::ast::{Atom, Decl, Expr, Lit, Name, QArg, Query, Rule, Span, Term as AstTerm, Ty};
 use crate::interp::value::compare;
@@ -34,6 +35,16 @@ use crate::interp::{type_of, Control, Env, Interpreter, RuntimeError, Value};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// The runtime value of a syntax literal.
+pub(crate) fn lit_value(lit: &Lit) -> Value {
+    match lit {
+        Lit::Int(n) => Value::Int(*n),
+        Lit::Bool(b) => Value::Bool(*b),
+        Lit::Str(s) => Value::Str(Rc::from(s.as_str())),
+        Lit::Unit => Value::Unit,
+    }
+}
 
 /// The distinct named holes of `q`, in order of first appearance.
 pub(crate) fn named_holes(q: &Query) -> Vec<Name> {
@@ -169,7 +180,7 @@ impl Interpreter {
                     .body
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, c)| self.as_generator(c).map(|(r, _)| (i, r)))
+                    .filter_map(|(i, c)| as_generator(&self.program, c).map(|(r, _)| (i, r)))
                     .collect();
                 if generators.is_empty() {
                     if first_round {
@@ -228,7 +239,7 @@ impl Interpreter {
         let mut filters = Vec::new();
         for (i, conjunct) in rule.body.iter().enumerate() {
             let mut next = Vec::new();
-            match self.as_generator(conjunct) {
+            match as_generator(&self.program, conjunct) {
                 Some((relation, args)) => {
                     for sub in &subs {
                         let mut pattern = Vec::with_capacity(args.len());
@@ -266,22 +277,6 @@ impl Interpreter {
             tuples.push(instantiate_head(&rule.head, sub, root)?);
         }
         Ok(tuples)
-    }
-
-    /// If `e` is a direct call to a declared relation, returns its name and
-    /// unevaluated arguments. Returns `None` for any other expression.
-    fn as_generator<'e>(&self, e: &'e Expr) -> Option<(&'e Name, &'e [Expr])> {
-        match e {
-            Expr::Call(callee, args, _) => match &**callee {
-                Expr::Var(name, _)
-                    if matches!(self.program.decls.get(name), Some(Decl::Relation(_))) =>
-                {
-                    Some((name, args.as_slice()))
-                }
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Evaluate `filter` in `root` extended with `sub`. A non-`Bool` result is
@@ -330,16 +325,6 @@ fn instantiate_head(head: &Atom, sub: &Subst, root: &Env) -> Result<Tuple, Contr
 fn bind_all(root: &Env, sub: &Subst) -> Env {
     sub.iter()
         .fold(root.clone(), |env, (x, v)| env.extend(x.clone(), v.clone()))
-}
-
-/// The value of a literal.
-fn lit_value(lit: &Lit) -> Value {
-    match lit {
-        Lit::Int(n) => Value::Int(*n),
-        Lit::Bool(b) => Value::Bool(*b),
-        Lit::Str(s) => Value::Str(Rc::from(s.as_str())),
-        Lit::Unit => Value::Unit,
-    }
 }
 
 /// The lexicographic `compare` order on equal-length solution rows.

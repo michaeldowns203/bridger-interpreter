@@ -33,6 +33,7 @@ use crate::ast::{
     BinOp, Decl, Expr, Lit, Name, QArg, Query, Rel, Rule, Span, Stmt, Term, Ty, TyKind, UnOp,
 };
 use crate::interp::prelude::native_names;
+use crate::relations::check::as_generator;
 use std::collections::HashSet;
 
 impl Checker {
@@ -467,11 +468,7 @@ impl Checker {
             }
             Expr::ForQuery(q, body, span) => {
                 let holes = self.check_query(q, ctx, *span, false)?;
-                let body_ctx = holes
-                    .into_iter()
-                    .fold(ctx.clone(), |intermediate_ctx, (name, ty)| {
-                        intermediate_ctx.extend(name, ty)
-                    });
+                let body_ctx = extend_all(ctx, holes);
                 self.check_expr(body, &body_ctx, Some(&Ty::unit()))?;
                 self.finish_expr(Ty::unit(), expected, *span)
             }
@@ -577,21 +574,11 @@ impl Checker {
         let mut vars: Vec<(Name, Ty)> = Vec::new();
         let mut filters = Vec::new();
         for conjunct in &rule.body {
-            let (name, args, span) = match conjunct {
-                Expr::Call(f, args, span) => match &**f {
-                    Expr::Var(name, _) if matches!(self.decl(name), Some(Decl::Relation(_))) => {
-                        (name, args, *span)
-                    }
-                    _ => {
-                        filters.push(conjunct);
-                        continue;
-                    }
-                },
-                _ => {
-                    filters.push(conjunct);
-                    continue;
-                }
+            let Some((name, args)) = as_generator(&self.program, conjunct) else {
+                filters.push(conjunct);
+                continue;
             };
+            let span = conjunct.span();
             let column_tys = self.relation_column_tys(name, &root, span)?;
             let col_tys_len = column_tys.len();
             let args_len = args.len();
@@ -621,11 +608,7 @@ impl Checker {
                 }
             }
         }
-        let body_ctx = vars
-            .into_iter()
-            .fold(root.clone(), |intermediate_ctx, (x, ty)| {
-                intermediate_ctx.extend(x, ty)
-            });
+        let body_ctx = extend_all(&root, vars);
 
         let head = &rule.head;
         let column_tys = self.relation_column_tys(&head.name, &root, head.span)?;
@@ -721,6 +704,15 @@ impl Checker {
             }),
         }
     }
+}
+
+/// `ctx` extended with each `(name, type)` in `bindings`, in order.
+fn extend_all(ctx: &Ctx, bindings: Vec<(Name, Ty)>) -> Ctx {
+    bindings
+        .into_iter()
+        .fold(ctx.clone(), |intermediate_ctx, (name, ty)| {
+            intermediate_ctx.extend(name, ty)
+        })
 }
 
 /// Provided helpers (Milestone M5): plumbing that no typing rule describes.

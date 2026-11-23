@@ -29,7 +29,10 @@
 //! choice is silently lost.
 
 use super::{contains_meta, Checker, Ctx, TyError, MAX_NESTING};
-use crate::ast::{BinOp, Decl, Expr, Lit, Rule, Span, Stmt, Ty, TyKind, UnOp};
+use crate::ast::{
+    BinOp, Decl, Expr, Lit, Name, QArg, Query, Rel, Rule, Span, Stmt, Term, Ty, TyKind, UnOp,
+};
+use crate::interp::prelude::native_names;
 use std::collections::HashSet;
 
 impl Checker {
@@ -107,6 +110,11 @@ impl Checker {
                     ty?
                 } else if let Some(ty) = self.native_fn_type(name, *span) {
                     ty
+                } else if let Some(Decl::Relation(_)) = self.decl(name) {
+                    return Err(TyError::RelationNotAValue {
+                        name: name.clone(),
+                        span: *span,
+                    });
                 } else {
                     return Err(TyError::UnboundVariable {
                         name: name.clone(),
@@ -377,6 +385,18 @@ impl Checker {
                 self.finish_expr(ty, expected, *span)
             }
             Expr::Call(f, args, span) => {
+                if let Expr::Var(name, _) = &**f {
+                    if ctx.lookup(name).is_none()
+                        && matches!(self.decl(name), Some(Decl::Relation(_)))
+                    {
+                        let q = Query {
+                            name: name.clone(),
+                            args: args.iter().cloned().map(QArg::Expr).collect(),
+                        };
+                        self.check_query(&q, ctx, *span, false)?;
+                        return self.finish_expr(Ty::bool(), expected, *span);
+                    }
+                }
                 let (f_ty, bounds) = self.check_callee(f, ctx)?;
                 let ty = match &f_ty.kind {
                     TyKind::Fn(param_tys, ret) => {
@@ -419,8 +439,42 @@ impl Checker {
             }
 
             // ---- M6: relations ----
-            Expr::Relation(..) => todo_m6!("T-Add / T-Clear / T-Solutions / T-Query"),
-            Expr::ForQuery(..) => todo_m6!("T-ForQuery"),
+            Expr::Relation(rel, span) => {
+                let ty = match rel {
+                    Rel::Add(q) => {
+                        self.check_query(q, ctx, *span, true)?;
+                        Ty::unit()
+                    }
+                    Rel::Clear(name) => {
+                        self.relation_column_tys(name, ctx, *span)?;
+                        Ty::unit()
+                    }
+                    Rel::Solutions(q) => {
+                        let holes = self.check_query(q, ctx, *span, false)?;
+                        let mut tys: Vec<Ty> = holes.into_iter().map(|(_, t)| t).collect();
+                        Ty::list(match tys.len() {
+                            0 => Ty::unit(),
+                            1 => tys.pop().unwrap(),
+                            _ => Ty::tuple(tys),
+                        })
+                    }
+                    Rel::Query(q) => {
+                        self.check_query(q, ctx, *span, false)?;
+                        Ty::bool()
+                    }
+                };
+                self.finish_expr(ty, expected, *span)
+            }
+            Expr::ForQuery(q, body, span) => {
+                let holes = self.check_query(q, ctx, *span, false)?;
+                let body_ctx = holes
+                    .into_iter()
+                    .fold(ctx.clone(), |intermediate_ctx, (name, ty)| {
+                        intermediate_ctx.extend(name, ty)
+                    });
+                self.check_expr(body, &body_ctx, Some(&Ty::unit()))?;
+                self.finish_expr(Ty::unit(), expected, *span)
+            }
 
             // ---- M7: algebraic data types ----
             Expr::Ctor(..) => todo_m7!("T-Con"),
@@ -518,8 +572,152 @@ impl Checker {
     /// for the filters; the driver runs it over each rule once relations
     /// arrive.
     pub fn check_rule(&mut self, rule: &Rule) -> Result<(), TyError> {
-        let _ = rule;
-        todo_m6!("check_rule (generators bind logic variables; head and filters typed)")
+        let root = Ctx::new(None, None);
+
+        let mut vars: Vec<(Name, Ty)> = Vec::new();
+        let mut filters = Vec::new();
+        for conjunct in &rule.body {
+            let (name, args, span) = match conjunct {
+                Expr::Call(f, args, span) => match &**f {
+                    Expr::Var(name, _) if matches!(self.decl(name), Some(Decl::Relation(_))) => {
+                        (name, args, *span)
+                    }
+                    _ => {
+                        filters.push(conjunct);
+                        continue;
+                    }
+                },
+                _ => {
+                    filters.push(conjunct);
+                    continue;
+                }
+            };
+            let column_tys = self.relation_column_tys(name, &root, span)?;
+            let col_tys_len = column_tys.len();
+            let args_len = args.len();
+            if col_tys_len != args_len {
+                return Err(TyError::RelationArity {
+                    name: name.clone(),
+                    expected: col_tys_len,
+                    found: args_len,
+                    span,
+                });
+            }
+            for (arg, column_ty) in args.iter().zip(&column_tys) {
+                match arg {
+                    Expr::Var(x, at) => match vars.iter().find(|(v, _)| v == x) {
+                        Some((_, ty)) => {
+                            self.unify(ty, column_ty, *at)?;
+                            self.record(*at, column_ty.clone());
+                        }
+                        None => {
+                            vars.push((x.clone(), column_ty.clone()));
+                            self.record(*at, column_ty.clone());
+                        }
+                    },
+                    other => {
+                        self.check_expr(other, &root, Some(column_ty))?;
+                    }
+                }
+            }
+        }
+        let body_ctx = vars
+            .into_iter()
+            .fold(root.clone(), |intermediate_ctx, (x, ty)| intermediate_ctx.extend(x, ty));
+
+        let head = &rule.head;
+        let column_tys = self.relation_column_tys(&head.name, &root, head.span)?;
+        let col_tys_len = column_tys.len();
+        let terms_len = head.terms.len();
+        if col_tys_len != terms_len {
+            return Err(TyError::RelationArity {
+                name: head.name.clone(),
+                expected: col_tys_len,
+                found: terms_len,
+                span: head.span,
+            });
+        }
+        for (term, column_ty) in head.terms.iter().zip(&column_tys) {
+            let ty = match term {
+                Term::Var(x) => match body_ctx.lookup(x) {
+                    Some(ty) => ty,
+                    None => self.check_expr(&Expr::Var(x.clone(), head.span), &body_ctx, None)?,
+                },
+                Term::Lit(lit) => {
+                    self.check_expr(&Expr::Lit(lit.clone(), head.span), &body_ctx, None)?
+                }
+            };
+            self.unify(&ty, column_ty, head.span)?;
+        }
+
+        for filter in filters {
+            self.check_expr(filter, &body_ctx, Some(&Ty::bool()))?;
+        }
+        Ok(())
+    }
+
+    /// Checks `q` against its relation: the argument count (`RelationArity`),
+    /// then each bound argument at its column type. A named hole takes its
+    /// column type, which must agree across repeats; with `is_add`, a hole is
+    /// `HoleInAdd`. Returns the named holes and their types in order of first
+    /// appearance.
+    fn check_query(
+        &mut self,
+        q: &Query,
+        ctx: &Ctx,
+        span: Span,
+        is_add: bool,
+    ) -> Result<Vec<(Name, Ty)>, TyError> {
+        let column_tys = self.relation_column_tys(&q.name, ctx, span)?;
+        let col_tys_len = column_tys.len();
+        let args_len = q.args.len();
+        if col_tys_len != args_len {
+            return Err(TyError::RelationArity {
+                name: q.name.clone(),
+                expected: col_tys_len,
+                found: args_len,
+                span,
+            });
+        }
+        let mut holes: Vec<(Name, Ty)> = Vec::new();
+        for (arg, column_ty) in q.args.iter().zip(&column_tys) {
+            match arg {
+                QArg::Expr(e) => {
+                    self.check_expr(e, ctx, Some(column_ty))?;
+                }
+                QArg::Hole(_) if is_add => return Err(TyError::HoleInAdd { span }),
+                QArg::Hole(Some(x)) => match holes.iter().find(|(h, _)| h == x) {
+                    Some((_, ty)) => {
+                        self.unify(ty, column_ty, span)?;
+                    }
+                    None => holes.push((x.clone(), column_ty.clone())),
+                },
+                QArg::Hole(None) => {}
+            }
+        }
+        Ok(holes)
+    }
+
+    /// The column types of relation `name`. `NotARelation` if a local, another
+    /// declaration, or a native has that name; `UndeclaredRelation` if nothing
+    /// does.
+    fn relation_column_tys(&self, name: &str, ctx: &Ctx, span: Span) -> Result<Vec<Ty>, TyError> {
+        let not_a_relation = || TyError::NotARelation {
+            name: name.to_string(),
+            span,
+        };
+        if ctx.lookup(name).is_some() {
+            return Err(not_a_relation());
+        }
+        match self.decl(name) {
+            Some(Decl::Relation(columns)) => Ok(columns.clone()),
+            Some(_) => Err(not_a_relation()),
+            None if native_names().any(|n| n == name) => Err(not_a_relation()),
+            None => Err(TyError::UndeclaredRelation {
+                name: name.to_string(),
+                span,
+            }),
+        }
     }
 }
 

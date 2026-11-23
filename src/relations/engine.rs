@@ -60,8 +60,16 @@ impl Interpreter {
     ) -> Result<usize, Control> {
         match (env.lookup(name), self.program.decls.get(name)) {
             (Some(Value::Relation(_)), Some(Decl::Relation(columns))) => Ok(columns.len()),
-            (None, _) => Err(RuntimeError::UnboundVariable { name: name.to_string(), span }.into()),
-            _ => Err(RuntimeError::NotARelation { name: name.to_string(), span }.into()),
+            (None, _) => Err(RuntimeError::UnboundVariable {
+                name: name.to_string(),
+                span,
+            }
+            .into()),
+            _ => Err(RuntimeError::NotARelation {
+                name: name.to_string(),
+                span,
+            }
+            .into()),
         }
     }
 
@@ -281,14 +289,12 @@ impl Interpreter {
     fn filter_holds(&mut self, filter: &Expr, sub: &Subst, root: &Env) -> Result<bool, Control> {
         match self.eval_expr(filter, &bind_all(root, sub)) {
             Ok(Value::Bool(b)) => Ok(b),
-            Ok(other) => {
-                Err(RuntimeError::TypeError {
-                    expected: Ty::bool(),
-                    found: type_of(&other),
-                    span: filter.span(),
-                }
-                .into())
+            Ok(other) => Err(RuntimeError::TypeError {
+                expected: Ty::bool(),
+                found: type_of(&other),
+                span: filter.span(),
             }
+            .into()),
             Err(Control::Return(_)) => Err(RuntimeError::ReturnOutsideFunction {
                 span: filter.span(),
             }

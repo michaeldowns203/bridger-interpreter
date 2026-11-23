@@ -28,7 +28,7 @@
 //! [`RelationDb`]: RelationDb
 
 use super::{RelationDb, Subst, Term, Tuple};
-use crate::ast::{self, Decl, Expr, Lit, Name, QArg, Query, Rule, Span, Ty};
+use crate::ast::{Atom, Decl, Expr, Lit, Name, QArg, Query, Rule, Span, Term as AstTerm, Ty};
 use crate::interp::value::compare;
 use crate::interp::{type_of, Control, Env, Interpreter, RuntimeError, Value};
 use std::cmp::Ordering;
@@ -300,12 +300,12 @@ impl Interpreter {
 
 /// The tuple `head` gives under `sub`; a variable `sub` leaves unbound is
 /// looked up in `root`.
-fn instantiate_head(head: &ast::Atom, sub: &Subst, root: &Env) -> Result<Tuple, Control> {
+fn instantiate_head(head: &Atom, sub: &Subst, root: &Env) -> Result<Tuple, Control> {
     head.terms
         .iter()
         .map(|t| match t {
-            ast::Term::Lit(lit) => Ok(lit_value(lit)),
-            ast::Term::Var(x) => sub
+            AstTerm::Lit(lit) => Ok(lit_value(lit)),
+            AstTerm::Var(x) => sub
                 .get(x)
                 .cloned()
                 .or_else(|| root.lookup(x))

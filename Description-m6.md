@@ -113,19 +113,19 @@ receiver types select that head's methods; an unknown receiver makes the analysi
 > Point out anything that was tricky, a bug you fixed, or a design choice you made. If you used an assistant, say what you had it do and how you
 > checked its work.
 
-I had to work through the difference between a substitution and an environment. A substitution holds the values found by matching
-generators, while `bind_all` adds those bindings to the root environment so a filter can use both logic variables and top-level names.
-I also needed to trace how one empty substitution can become several matches, and why semi-naive evaluation lets one generator
-read new facts while the others read all known facts. Requiring every generator to read only new facts would miss matches between
-old and new facts.
+`solutions` was the hardest part of the engine. One empty `Subst` grows into many matches as each generator joins, and filters must
+wait until every generator has bound its variables; an early bug tested filters too soon, so `fire` now joins all generators first.
+A naive fixpoint took about 16 seconds on the 150-edge transitive-closure test, so I made it semi-naive: one generator reads only the
+previous round's new facts and the others read every known fact (making all of them read new facts would miss old/new joins).
 
-The purity check took more explanation because a filter can reach an effect through several function calls. Walking through the
-call graph and the witness helped me distinguish finding an effect from detecting recursion. One bug was evaluating filters before
-later generators had bound their variables; `fire` now joins every generator first. The purity checker also needed to distinguish
-methods by receiver type and construct witnesses in source order rather than discovery order.
+`check_pure` was the hardest check, because a filter can reach an effect through a chain of calls, a method, or a callback to
+`map`/`filter`/`fold`. I compute the impure set once as a least fixpoint and build the witness by following calls from the filter,
+in source order. Design choices: the checks run in the order HigherOrder, Impure, Recursive, so recursion is reported only for an
+otherwise pure filter; prelude functions are trusted for HigherOrder and Recursive; a method call is narrowed to one impl only when
+declarations settle the receiver's type, and otherwise reaches every impl of that name; and a call to a local is treated as an
+effect.
 
-I asked Claude Code to explain the concepts and write most of the initial implementation, then checked it with `cargo m6`, the
-example programs, and code walkthroughs. Codex later reviewed and refactored the code, fixed the ordering and purity issues, and
-helped revise this description. It verified the changes with cumulative `cargo m6` tests, formatting, Clippy, and focused purity
-checks outside the repository. I checked its explanations by asking follow-up questions about substitutions, environments, the
-fixpoint rounds, and how the purity checker follows calls.
+I asked Claude Code to explain the general ideas and create a template for the initial implementation. As I worked through the implementation,
+I had it explain confusing concepts, help me with Rust syntax, and fix bugs I encountered. Then, I checked it with `cargo m6`, the
+example programs, and code walkthroughs. I checked its explanations by asking follow-up questions and ensuring I understood each why each
+implementation detail was necessary to satisfy each piece of the specification.

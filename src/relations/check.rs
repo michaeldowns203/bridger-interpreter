@@ -23,7 +23,7 @@
 
 use self::helpers::{bound_names, free_vars, subexprs};
 use super::RuleError;
-use crate::ast::{Decl, Expr, Name, Program, Rel, Rule, SrcId, Term, Ty, TyKind, UnOp};
+use crate::ast::{Decl, Expr, Lit, Name, Param, Program, Rel, Rule, SrcId, Term, Ty, TyKind, UnOp};
 use crate::interp::prelude::native_names;
 use std::collections::{HashMap, HashSet};
 
@@ -194,8 +194,485 @@ pub fn check_range_restriction(
 /// calls from the filter to the effect it reaches (`Impure { witness }`).
 /// `generators` is `check_generators`'s answer for this rule.
 pub fn check_pure(program: &Program, rule: &Rule, generators: &[bool]) -> Result<(), RuleError> {
-    let _ = (program, rule, generators);
-    todo_m6!("check_pure: every filter is a pure, total function of the bound variables")
+    let purity = Purity::new(program);
+    let mut scope = PurityScope::default();
+    for conjunct in &rule.body {
+        if let Some((name, args)) = as_generator(program, conjunct) {
+            if let Some(Decl::Relation(columns)) = program.decls.get(name) {
+                for (arg, ty) in args.iter().zip(columns) {
+                    if let Expr::Var(x, _) = arg {
+                        scope.locals.insert(x.clone());
+                        scope.types.insert(x.clone(), ty.clone());
+                    }
+                }
+            }
+        }
+    }
+    for conjunct in &rule.body {
+        scope.hide_bindings(conjunct);
+    }
+    for (filter, _) in rule.body.iter().zip(generators).filter(|(_, g)| !**g) {
+        let span = filter.span();
+
+        let reached = purity.reached(filter, &scope);
+        if let Some(name) = reached.iter().find(|k| purity.higher_order(k)) {
+            return Err(RuleError::HigherOrder {
+                name: name.clone(),
+                span,
+            });
+        }
+        if let Some(witness) = purity.effect(filter, &scope, &[]) {
+            return Err(RuleError::Impure { span, witness });
+        }
+        if let Some(name) = reached.iter().find(|k| purity.recursive(k)) {
+            return Err(RuleError::Recursive {
+                name: name.clone(),
+                span,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is an impure native: output, `to_string`, or a reader.
+fn impure_native(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "println"
+            | "to_string"
+            | "read_int"
+            | "read_bool"
+            | "read_line"
+            | "read_int_opt"
+            | "read_bool_opt"
+            | "read_line_opt"
+    )
+}
+
+/// The callback's argument index for `map`, `filter`, and `fold`.
+fn callback_index(native: &str) -> Option<usize> {
+    match native {
+        "map" | "filter" => Some(1),
+        "fold" => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether `ty` contains a function type.
+fn has_fn_type(ty: &Ty) -> bool {
+    match &ty.kind {
+        TyKind::Fn(..) => true,
+        TyKind::List(t) | TyKind::Ref(t) => has_fn_type(t),
+        TyKind::Tuple(ts) | TyKind::Named(_, ts) => ts.iter().any(has_fn_type),
+        _ => false,
+    }
+}
+
+/// Locals for call classification, and declared types safe to use for receivers.
+#[derive(Default)]
+struct PurityScope {
+    locals: HashSet<Name>,
+    types: HashMap<Name, Ty>,
+}
+
+impl PurityScope {
+    fn hide_bindings(&mut self, expr: &Expr) {
+        for name in bound_names(expr) {
+            self.types.remove(&name);
+            self.locals.insert(name);
+        }
+    }
+}
+
+/// A callable's body, its local names, and whether it takes a
+/// function-typed parameter.
+struct Body<'p> {
+    expr: &'p Expr,
+    scope: PurityScope,
+    higher_order: bool,
+    /// Prelude callables, exempt from the recursion and higher-order checks.
+    trusted: bool,
+}
+
+impl<'p> Body<'p> {
+    fn new(expr: &'p Expr, params: &[Param], self_ty: Option<&Ty>, trusted: bool) -> Self {
+        let mut scope = PurityScope::default();
+        for param in params {
+            scope.locals.insert(param.name.clone());
+            let ty = if matches!(param.ty.kind, TyKind::SelfTy) {
+                self_ty.unwrap_or(&param.ty)
+            } else {
+                &param.ty
+            };
+            scope.types.insert(param.name.clone(), ty.clone());
+        }
+        if let Some(ty) = self_ty {
+            scope.locals.insert("self".into());
+            scope.types.insert("self".into(), ty.clone());
+        }
+        scope.hide_bindings(expr);
+        Self {
+            expr,
+            scope,
+            higher_order: params.iter().any(|p| has_fn_type(&p.ty)),
+            trusted,
+        }
+    }
+}
+
+/// The purity analysis of a program. Callables are keyed by name: a function
+/// as `f`, and methods by head and name as `H.m`. `impure` maps
+/// each impure callable to its witness.
+struct Purity<'p> {
+    program: &'p Program,
+    bodies: HashMap<Name, Vec<Body<'p>>>,
+    calls: HashMap<Name, Vec<Name>>,
+    impure: HashMap<Name, Vec<Name>>,
+}
+
+impl<'p> Purity<'p> {
+    /// Collects every callable's body and computes the impure set as a least
+    /// fixpoint: each round marks every callable whose body reaches an effect,
+    /// given those marked so far, until a round marks none.
+    fn new(program: &'p Program) -> Self {
+        let mut bodies: HashMap<Name, Vec<Body<'p>>> = HashMap::new();
+        for (name, decl) in &program.decls {
+            if let Decl::Fn(_, params, _, body) = decl {
+                let trusted = program.spans.get(name).is_some_and(|s| s.src == SrcId(0));
+                bodies.insert(name.clone(), vec![Body::new(body, params, None, trusted)]);
+            }
+        }
+        for imp in &program.impls {
+            let Some(head) = Self::type_head(program, &imp.ty) else {
+                continue;
+            };
+            for method in &imp.methods {
+                bodies
+                    .entry(format!("{head}.{}", method.name))
+                    .or_default()
+                    .push(Body::new(
+                        &method.body,
+                        &method.params,
+                        Some(&imp.ty),
+                        imp.span.src == SrcId(0),
+                    ));
+            }
+        }
+        let mut purity = Self {
+            program,
+            bodies,
+            calls: HashMap::new(),
+            impure: HashMap::new(),
+        };
+        for (key, bodies) in &purity.bodies {
+            let mut refs = Vec::new();
+            for body in bodies {
+                purity.refs(body.expr, &body.scope, &mut refs);
+            }
+            purity.calls.insert(key.clone(), refs);
+        }
+        purity.find_impure();
+        purity
+    }
+
+    fn find_impure(&mut self) {
+        let mut keys: Vec<_> = self.bodies.keys().cloned().collect();
+        keys.sort();
+        loop {
+            let mut changed = false;
+            for key in &keys {
+                if self.impure.contains_key(key) {
+                    continue;
+                }
+                if let Some(witness) = self.bodies[key]
+                    .iter()
+                    .find_map(|b| self.effect(b.expr, &b.scope, &[]))
+                {
+                    self.impure.insert(key.clone(), witness);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn type_head(program: &Program, ty: &Ty) -> Option<Name> {
+        Some(match &ty.kind {
+            TyKind::Int => "Int".into(),
+            TyKind::Bool => "Bool".into(),
+            TyKind::Str => "String".into(),
+            TyKind::Unit => "()".into(),
+            TyKind::List(_) => "[]".into(),
+            TyKind::Named(n, _)
+                if matches!(
+                    program.decls.get(n),
+                    Some(Decl::Struct(..) | Decl::Type(..))
+                ) =>
+            {
+                n.clone()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Only declarations settle a receiver; calls and local initializers do not.
+    fn receiver_type(&self, e: &Expr, scope: &PurityScope) -> Option<Ty> {
+        match e {
+            Expr::Var(x, _) if scope.locals.contains(x) => scope.types.get(x).cloned(),
+            Expr::Var(x, _) => match x.as_str() {
+                "Int" => Some(Ty::int()),
+                "Bool" => Some(Ty::bool()),
+                "String" => Some(Ty::str()),
+                _ if matches!(
+                    self.program.decls.get(x),
+                    Some(Decl::Struct(..) | Decl::Type(..))
+                ) =>
+                {
+                    Some(Ty::named(x.clone(), vec![]))
+                }
+                _ => None,
+            },
+            Expr::Struct(x, ..) => Some(Ty::named(x.clone(), vec![])),
+            Expr::Lit(lit, _) => Some(match lit {
+                Lit::Int(_) => Ty::int(),
+                Lit::Bool(_) => Ty::bool(),
+                Lit::Str(_) => Ty::str(),
+                Lit::Unit => Ty::unit(),
+            }),
+            Expr::Field(recv, field, _) => {
+                let ty = self.receiver_type(recv, scope)?;
+                let TyKind::Named(name, args) = &ty.kind else {
+                    return None;
+                };
+                let Decl::Struct(generics, fields) = self.program.decls.get(name)? else {
+                    return None;
+                };
+                let substitutions = generics
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(p, t)| (p.name.clone(), t.clone()))
+                    .collect();
+                Some(
+                    fields
+                        .iter()
+                        .find(|f| f.name == *field)?
+                        .ty
+                        .substitute(&substitutions),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn method_key(&self, recv: &Expr, method: &str, scope: &PurityScope) -> Name {
+        let head = self
+            .receiver_type(recv, scope)
+            .and_then(|ty| Self::type_head(self.program, &ty))
+            .unwrap_or_default();
+        format!("{head}.{method}")
+    }
+
+    fn conversions(&self) -> Vec<Name> {
+        self.program
+            .impls
+            .iter()
+            .filter(|imp| imp.trait_.as_ref().is_some_and(|t| t.name == "From"))
+            .filter_map(|imp| Self::type_head(self.program, &imp.ty))
+            .map(|head| format!("{head}.from"))
+            .collect()
+    }
+
+    /// An unsettled method name reaches every head that implements it.
+    fn targets(&self, key: &str) -> Vec<Name> {
+        let mut targets: Vec<_> = self
+            .bodies
+            .keys()
+            .filter(|name| {
+                if key.starts_with('.') {
+                    name.ends_with(key)
+                } else {
+                    name.as_str() == key
+                }
+            })
+            .cloned()
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// The witness of the first effect `e` reaches in source order, or `None`
+    /// if `e` is pure. Empty for an effect of `e`'s own form; otherwise the
+    /// names called through, ending at the impure native or queried relation.
+    fn effect(&self, e: &Expr, scope: &PurityScope, path: &[Name]) -> Option<Vec<Name>> {
+        match e {
+            Expr::Unary(UnOp::Ref | UnOp::Deref, ..)
+            | Expr::Assign(..)
+            | Expr::While(..)
+            | Expr::For(..)
+            | Expr::ForQuery(..)
+            | Expr::Relation(Rel::Add(_) | Rel::Clear(_) | Rel::Solutions(_), _) => Some(vec![]),
+            Expr::Relation(Rel::Query(q), _) => Some(vec![q.name.clone()]),
+            Expr::Var(x, _) => self.mention(x, scope, path),
+            Expr::Call(callee, args, _) => {
+                let first = match &**callee {
+                    Expr::Var(f, _) => self.call(f, args, scope, path),
+                    Expr::Lambda(..) => Some(vec![]),
+                    other => Some(self.effect(other, scope, path).unwrap_or_default()),
+                };
+                first.or_else(|| args.iter().find_map(|a| self.effect(a, scope, path)))
+            }
+            Expr::Method(recv, m, args, _) => self
+                .effect(recv, scope, path)
+                .or_else(|| self.through(&self.method_key(recv, m, scope), path))
+                .or_else(|| args.iter().find_map(|a| self.effect(a, scope, path))),
+            Expr::Try(inner, _) => self.effect(inner, scope, path).or_else(|| {
+                self.conversions()
+                    .iter()
+                    .find_map(|key| self.through(key, path))
+            }),
+            _ => subexprs(e)
+                .into_iter()
+                .find_map(|c| self.effect(c, scope, path)),
+        }
+    }
+
+    /// `key` followed by its witness, if `key` is impure.
+    fn through(&self, key: &str, path: &[Name]) -> Option<Vec<Name>> {
+        for target in self.targets(key) {
+            if !self.impure.contains_key(&target) || path.contains(&target) {
+                continue;
+            }
+            let mut next_path = path.to_vec();
+            next_path.push(target.clone());
+            if let Some(witness) = self.bodies[&target]
+                .iter()
+                .find_map(|body| self.effect(body.expr, &body.scope, &next_path))
+            {
+                let mut witness = witness;
+                witness.insert(0, key.to_string());
+                return Some(witness);
+            }
+        }
+        None
+    }
+
+    /// The effect of naming `x` as a value: a function counts as called, and
+    /// an impure native is an effect.
+    fn mention(&self, x: &str, scope: &PurityScope, path: &[Name]) -> Option<Vec<Name>> {
+        if scope.locals.contains(x) {
+            return None;
+        }
+        match self.program.decls.get(x) {
+            Some(Decl::Fn(..)) => self.through(x, path),
+            Some(_) => None,
+            None if impure_native(x) => Some(vec![x.to_string()]),
+            None => None,
+        }
+    }
+
+    /// The effect of calling `f`, judged by what `f` names; excludes the
+    /// arguments' own effects.
+    fn call(
+        &self,
+        f: &str,
+        args: &[Expr],
+        scope: &PurityScope,
+        path: &[Name],
+    ) -> Option<Vec<Name>> {
+        let one = || Some(vec![f.to_string()]);
+        if scope.locals.contains(f) {
+            return one();
+        }
+        match self.program.decls.get(f) {
+            Some(Decl::Fn(..)) => self.through(f, path),
+            Some(_) => one(),
+            None if impure_native(f) => one(),
+            None if is_native(f) => {
+                let callback = callback_index(f).and_then(|i| args.get(i))?;
+                match callback {
+                    Expr::Lambda(..) => None,
+                    Expr::Var(g, _) if !scope.locals.contains(g) => match self.program.decls.get(g)
+                    {
+                        Some(Decl::Fn(..)) => None,
+                        None if is_native(g) && !impure_native(g) => None,
+                        _ => Some(vec![g.clone()]),
+                    },
+                    Expr::Var(g, _) => Some(vec![g.clone()]),
+                    _ => Some(vec![]),
+                }
+            }
+            None => one(),
+        }
+    }
+
+    /// The callables `e` reaches transitively, in the order first met.
+    fn reached(&self, e: &Expr, scope: &PurityScope) -> Vec<Name> {
+        let mut out = Vec::new();
+        self.refs(e, scope, &mut out);
+        self.follow_calls(&mut out);
+        out
+    }
+
+    /// Appends to `out` each callable `e` refers to directly, once.
+    fn refs(&self, e: &Expr, scope: &PurityScope, out: &mut Vec<Name>) {
+        let mut push = |key: String| {
+            for target in self.targets(&key) {
+                if !out.contains(&target) {
+                    out.push(target);
+                }
+            }
+        };
+        match e {
+            Expr::Var(x, _) if !scope.locals.contains(x) => {
+                if matches!(self.program.decls.get(x), Some(Decl::Fn(..))) {
+                    push(x.clone());
+                }
+            }
+            Expr::Method(recv, m, _, _) => push(self.method_key(recv, m, scope)),
+            Expr::Try(..) => {
+                for key in self.conversions() {
+                    push(key);
+                }
+            }
+            _ => {}
+        }
+        for c in subexprs(e) {
+            self.refs(c, scope, out);
+        }
+    }
+
+    /// Whether `key` takes a function-typed parameter.
+    fn higher_order(&self, key: &str) -> bool {
+        self.bodies[key]
+            .iter()
+            .any(|b| !b.trusted && b.higher_order)
+    }
+
+    /// Whether `key` can reach itself.
+    fn recursive(&self, key: &str) -> bool {
+        if self.bodies[key].iter().all(|b| b.trusted) {
+            return false;
+        }
+        let mut reached = self.calls[key].clone();
+        self.follow_calls(&mut reached);
+        reached.iter().any(|name| name == key)
+    }
+
+    fn follow_calls(&self, reached: &mut Vec<Name>) {
+        let mut i = 0;
+        while i < reached.len() {
+            for next in &self.calls[&reached[i]] {
+                if !reached.contains(next) {
+                    reached.push(next.clone());
+                }
+            }
+            i += 1;
+        }
+    }
 }
 
 /// Every `match` guard in the program must be pure (M7): a guard is a test

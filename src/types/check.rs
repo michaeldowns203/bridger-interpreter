@@ -907,3 +907,182 @@ mod helpers {
         }
     }
 }
+
+/// Provided helpers (Milestone M7): the usefulness test behind
+/// exhaustiveness checking. Paste this module at the end of the file,
+/// unchanged. Until `is_exhaustive` calls `covers`, nothing reaches this
+/// module, so `dead_code` is allowed here.
+#[allow(dead_code)]
+pub mod exhaustive {
+    use crate::ast::{Name, Ty};
+    use std::collections::HashSet;
+
+    /// A pattern as the usefulness test sees it: a wildcard, a constructor
+    /// applied to sub-patterns, or two alternatives. A variable is a
+    /// wildcard here, since it matches anything.
+    #[derive(Clone, Debug)]
+    pub enum Pat {
+        Wild,
+        Con(Con, Vec<Pat>),
+        Or(Box<Pat>, Box<Pat>),
+    }
+
+    /// The constructor at the head of a pattern. Literals are constructors
+    /// with no arguments; a tuple of width n is one constructor of arity n;
+    /// a list is `Nil` or `Cons(head, tail)`; a struct is one constructor
+    /// whose arguments are its fields in declaration order.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub enum Con {
+        Int(i64),
+        Bool(bool),
+        Str(String),
+        Unit,
+        Tuple(usize),
+        Nil,
+        Cons,
+        Ctor(Name),
+        Struct(Name),
+    }
+
+    /// A type's constructors, each with its argument types.
+    pub type Signature = Vec<(Con, Vec<Ty>)>;
+
+    /// The function `covers` asks for a type's signature: `None` for a type
+    /// that only a wildcard covers (`Int`, `String`, a function, ...).
+    pub type SignatureOf<'a> = dyn Fn(&Ty) -> Option<Signature> + 'a;
+
+    /// One row of the pattern matrix: a pattern per column.
+    type Row = Vec<Pat>;
+
+    /// Whether the rows cover every value of `ty`: no value of that type
+    /// escapes all of them.
+    pub fn covers(rows: &[Pat], ty: &Ty, signature: &SignatureOf<'_>) -> bool {
+        let matrix: Vec<Row> = rows.iter().map(|p| vec![p.clone()]).collect();
+        !useful(&matrix, &[Pat::Wild], std::slice::from_ref(ty), signature)
+    }
+
+    /// Whether some value (of `tys`, one type per column) matches `q` and
+    /// no row of `rows`.
+    fn useful(rows: &[Row], q: &[Pat], tys: &[Ty], sig: &SignatureOf<'_>) -> bool {
+        let Some((head, q_rest)) = q.split_first() else {
+            return rows.is_empty();
+        };
+        let (ty, tys_rest) = (&tys[0], &tys[1..]);
+        // Continue with `pats` in place of the first column.
+        let go = |rows2: &[Row], pats: Vec<Pat>, arg_tys: Vec<Ty>| {
+            let mut q2 = pats;
+            q2.extend_from_slice(q_rest);
+            let mut tys2 = arg_tys;
+            tys2.extend_from_slice(tys_rest);
+            useful(rows2, &q2, &tys2, sig)
+        };
+        match head {
+            Pat::Or(a, b) => {
+                go(rows, vec![(**a).clone()], vec![ty.clone()])
+                    || go(rows, vec![(**b).clone()], vec![ty.clone()])
+            }
+            Pat::Con(c, args) => {
+                let arg_tys = arg_types(sig(ty), c, args.len());
+                go(&specialize(rows, c, args.len()), args.clone(), arg_tys)
+            }
+            Pat::Wild => {
+                let heads = head_constructors(rows);
+                let complete = sig(ty).filter(|cons| is_complete(cons, &heads));
+                match complete {
+                    Some(cons) => cons.into_iter().any(|(c, arg_tys)| {
+                        let rows2 = specialize(rows, &c, arg_tys.len());
+                        go(&rows2, vec![Pat::Wild; arg_tys.len()], arg_tys)
+                    }),
+                    None => useful(&default_rows(rows), q_rest, tys_rest, sig),
+                }
+            }
+        }
+    }
+
+    /// Constructor `c`'s argument types, or `n` placeholders when the type
+    /// has no signature (a literal of `Int` or `String`).
+    fn arg_types(sig: Option<Signature>, c: &Con, n: usize) -> Vec<Ty> {
+        let found = sig.and_then(|s| s.into_iter().find(|(k, _)| k == c));
+        match found {
+            Some((_, tys)) => tys,
+            None => vec![Ty::meta(u32::MAX); n],
+        }
+    }
+
+    /// Whether every constructor of a (non-empty) signature heads some row.
+    fn is_complete(sig: &Signature, heads: &HashSet<Con>) -> bool {
+        !sig.is_empty() && sig.iter().all(|(c, _)| heads.contains(c))
+    }
+
+    /// Every constructor at the head of some row, alternatives flattened.
+    fn head_constructors(rows: &[Row]) -> HashSet<Con> {
+        fn heads(p: &Pat, out: &mut HashSet<Con>) {
+            match p {
+                Pat::Wild => {}
+                Pat::Con(c, _) => {
+                    out.insert(c.clone());
+                }
+                Pat::Or(a, b) => {
+                    heads(a, out);
+                    heads(b, out);
+                }
+            }
+        }
+        let mut out = HashSet::new();
+        for p in rows.iter().filter_map(|row| row.first()) {
+            heads(p, &mut out);
+        }
+        out
+    }
+
+    /// The rows specialized to constructor `c` of arity `n`: a row headed
+    /// by `c` gives its arguments then its other columns, a row headed by a
+    /// wildcard gives `n` wildcards then its other columns, and a row headed
+    /// by another constructor is dropped.
+    fn specialize(rows: &[Row], c: &Con, n: usize) -> Vec<Row> {
+        let mut out = Vec::new();
+        for row in rows {
+            let Some((head, rest)) = row.split_first() else {
+                continue;
+            };
+            match head {
+                Pat::Con(k, args) if k == c => {
+                    out.push([args.as_slice(), rest].concat());
+                }
+                Pat::Con(..) => {}
+                Pat::Wild => {
+                    let wilds = vec![Pat::Wild; n];
+                    out.push([wilds.as_slice(), rest].concat());
+                }
+                Pat::Or(a, b) => {
+                    for alt in [a, b] {
+                        let r = [std::slice::from_ref(&**alt), rest].concat();
+                        out.extend(specialize(&[r], c, n));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The rows headed by a wildcard, without that column.
+    fn default_rows(rows: &[Row]) -> Vec<Row> {
+        let mut out = Vec::new();
+        for row in rows {
+            let Some((head, rest)) = row.split_first() else {
+                continue;
+            };
+            match head {
+                Pat::Wild => out.push(rest.to_vec()),
+                Pat::Con(..) => {}
+                Pat::Or(a, b) => {
+                    for alt in [a, b] {
+                        let r = [std::slice::from_ref(&**alt), rest].concat();
+                        out.extend(default_rows(&[r]));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
